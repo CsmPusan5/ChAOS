@@ -1,5 +1,7 @@
+/*  Учёт питания и распределение ресурсов по узлам. */
 #include "sim.h"
 
+/* Суммарная мощность, потребляемая центром. */
 int total_power(void) {
     int p = 0;
     for (int i = 0; i < MAX_NODES; i++)
@@ -7,41 +9,41 @@ int total_power(void) {
     return p;
 }
 
-int try_place_task(Task* task) {
-    if (total_power() + task->req_power > center.power_limit) return 0;
-
-    for (int i = 0; i < MAX_NODES; i++) {
-        Node* node = &center.nodes[i];
-        if (node->max_cores - node->used_cores < task->req_cores) continue;
-        if (node->max_ram   - node->user_ram   < task->req_ram)   continue;
-        if (node->max_power - node->used_power < task->req_power) continue;
-
-        node->used_cores += task->req_cores;
-        node->user_ram   += task->req_ram;
-        node->used_power += task->req_power;
-        task->node_id    =  node->id;
-        return 1;
-    }
-    return 0;
+/* Проверка общих лимитов центра */
+int power_ok(int add) {
+    int tp = total_power() + add;
+    if ((double)tp * center.pue > (double)center.power_limit + 1e-9) return 0;
+    if (tp > center.cooling_limit) return 0;
+    return 1;
 }
 
-void end_task(Task* task) {
-    if (task->node_id < 0) return;
-    Node* node = &center.nodes[task->node_id];
-    node->used_cores -= task->req_cores;
-    node->user_ram   -= task->req_ram;
-    node->used_power -= task->req_power;
-    task->node_id    = -1;
+/* Занять ресурсы на узлах, помеченных в used_mask задания. */
+void alloc_take(Task *task) {
+    for (int i = 0; i < MAX_NODES; i++) {
+        if (!(task->used_mask & (1u << i))) continue;
+        center.nodes[i].used_cores += task->alloc_cores[i];
+        center.nodes[i].user_ram   += task->alloc_mem[i];
+        center.nodes[i].used_power += task->alloc_power[i];
+    }
 }
 
-int can_ever_fit(Task* task) {
+/* Вернуть ранее занятые ресурсы. */
+void alloc_give(Task *task) {
     for (int i = 0; i < MAX_NODES; i++) {
-        Node* node = &center.nodes[i];
-        if (node->max_cores >= task->req_cores &&
-            node->max_ram   >= task->req_ram &&
-            node->max_power >= task->req_power) {
-            return 1;
-            }
+        if (!(task->used_mask & (1u << i))) continue;
+        center.nodes[i].used_cores -= task->alloc_cores[i];
+        center.nodes[i].user_ram   -= task->alloc_mem[i];
+        center.nodes[i].used_power -= task->alloc_power[i];
     }
-    return 0;
+}
+
+/* Полностью очистить карту распределения задания. */
+void alloc_clear(Task *task) {
+    task->used_mask  = 0;
+    task->node_count = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+        task->alloc_cores[i] = 0;
+        task->alloc_mem[i]   = 0;
+        task->alloc_power[i] = 0;
+    }
 }

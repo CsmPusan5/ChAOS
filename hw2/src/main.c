@@ -33,6 +33,12 @@ double stat_energy      = 0.0;
 long long stat_wait_sum = 0;
 long long stat_turn_sum = 0;
 
+pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+sem_t node_sem[MAX_NODES];
+sem_t task_sem[MAX_TASKS];
+sem_t sched_sem;
+sem_t ack_sem;
+
 /* ---------- Разбор стратегии ---------- */
 static int parse_strategy(const char *s)
 {
@@ -108,6 +114,11 @@ int main(int argc, char **argv)
     signal(SIGTERM, on_signal);
     signal(SIGPIPE, SIG_IGN);
 
+    for (int i = 0; i < MAX_NODES; i++) sem_init(&node_sem[i], 0, 0);
+    for (int i = 0; i < MAX_TASKS; i++) sem_init(&task_sem[i], 0, 0);
+    sem_init(&sched_sem, 0, 0);
+    sem_init(&ack_sem,   0, 0);
+
     srand(seed);
     init_simulation();
 
@@ -156,5 +167,10 @@ int main(int argc, char **argv)
     print_summary();
 
     if (log_fd >= 0) close(log_fd);
+    for (int i = 0; i < MAX_NODES; i++) sem_destroy(&node_sem[i]);
+    for (int i = 0; i < MAX_TASKS; i++) sem_destroy(&task_sem[i]);
+    sem_destroy(&sched_sem);
+    sem_destroy(&ack_sem);
+    pthread_mutex_destroy(&mtx);
     return 0;
 }

@@ -1,6 +1,8 @@
 #ifndef SIM_H
 #define SIM_H
 
+#include <pthread.h>
+#include <semaphore.h>
 #include <signal.h>
 
 #define MAX_NODES 8
@@ -114,6 +116,13 @@ extern int    stat_node_fails;
 extern double stat_energy;
 extern long long stat_wait_sum;
 extern long long stat_turn_sum;
+
+/* ----------- Потоки ----------*/
+extern pthread_mutex_t mtx;              /* защита разделяемого состояния */
+extern sem_t node_sem[MAX_NODES];        /* фаза «узлы»                   */
+extern sem_t task_sem[MAX_TASKS];        /* фаза «задания»                */
+extern sem_t sched_sem;                  /* фаза «планировщик»            */
+extern sem_t ack_sem;                    /* квитанции о завершении фазы   */
 
 /* ---------- output.c ---------- */
 void out(const char *s);

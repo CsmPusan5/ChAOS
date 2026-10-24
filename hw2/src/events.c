@@ -168,7 +168,7 @@ void print_summary(void) {
         case DONE:      s = "выполнено";   break;
         case FAILED:    s = "отклонено";   break;
         }
-        outf("  %-8s %8d  %6d  %5d  %-12s  %7d  %8d\n",
+        outf("  %-10s %8d  %6d  %5d  %-12s  %7d  %8d\n",
              task->name, task->arrival_time,
              task->start_time  >= 0 ? task->start_time  : -1,
              task->finish_time >= 0 ? task->finish_time : -1,

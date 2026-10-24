@@ -45,7 +45,7 @@ static int cmp_jobs(const void *a, const void *b) {
         if (ta->arrival_time != tb->arrival_time)
             return ta->arrival_time - tb->arrival_time;
         break;
-    case EDF:
+    case EDF: {
         int da = ta->deadline;
         int db = tb->deadline;
         if (da == 0 && db != 0) return 1;
@@ -54,6 +54,7 @@ static int cmp_jobs(const void *a, const void *b) {
         if (ta->priority != tb->priority)
             return ta->priority - tb->priority;
         break;
+    }
     case SJF:
         if (ta->duration != tb->duration)
             return ta->duration - tb->duration;

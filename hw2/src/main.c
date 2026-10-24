@@ -76,24 +76,24 @@ static void usage(const char *prog)
 
 /* ---------- рабочий поток ---------- */
 void *worker_thread(void *arg) {
-    WorkerArg *w = (WorkerArg *)arg;
-    sem_t *my_sem = (w->type == 1) ? &node_sem[w->index]
-                  : (w->type == 2) ? &task_sem[w->index]
+    WorkerArg w = *(WorkerArg *)arg;
+    free(arg);
+    sem_t *my_sem = (w.type == 1) ? &node_sem[w.index]
+                  : (w.type == 2) ? &task_sem[w.index]
                   :                  &sched_sem;
 
     for (;;) {
         sem_wait(my_sem);
         if (stop_flag) {
-            sem_post(&ack_sem);
             return NULL;
         }
 
         pthread_mutex_lock(&mtx);
         int t = cur_time;
-        if (w->type == 1)
-            node_work(&center.nodes[w->index], t);
-        else if (w->type == 2)
-            task_work(&tasks[w->index], t);
+        if (w.type == 1)
+            node_work(&center.nodes[w.index], t);
+        else if (w.type == 2)
+            task_work(&tasks[w.index], t);
         else
             scheduler_work(t);
         pthread_mutex_unlock(&mtx);
@@ -125,7 +125,9 @@ void *clock_thread(void *arg) {
             }
         }
 
+        pthread_mutex_lock(&mtx);
         cur_time = t;
+        pthread_mutex_unlock(&mtx);
 
         /* Фаза 1: узлы */
         for (int i = 0; i < MAX_NODES; i++) sem_post(&node_sem[i]);
@@ -242,17 +244,29 @@ int main(int argc, char **argv)
     for (int i = 0; i < MAX_NODES; i++) {
         WorkerArg *a = malloc(sizeof(WorkerArg));
         a->type = 1; a->index = i;
-        pthread_create(&node_tid[i], NULL, worker_thread, a);
+        if (pthread_create(&node_tid[i], NULL, worker_thread, a) != 0) {
+            fprintf(stderr, "Ошибка создания потока узла %d\n", i);
+            free(a);
+            exit(1);
+        }
     }
     for (int i = 0; i < MAX_TASKS; i++) {
         WorkerArg *a = malloc(sizeof(WorkerArg));
         a->type = 2; a->index = i;
-        pthread_create(&task_tid[i], NULL, worker_thread, a);
+        if (pthread_create(&task_tid[i], NULL, worker_thread, a) != 0) {
+            fprintf(stderr, "Ошибка создания потока задания %d\n", i);
+            free(a);
+            exit(1);
+        }
     }
     {
         WorkerArg *a = malloc(sizeof(WorkerArg));
         a->type = 3; a->index = 0;
-        pthread_create(&sched_tid, NULL, worker_thread, a);
+        if (pthread_create(&sched_tid, NULL, worker_thread, a) != 0) {
+            fprintf(stderr, "Ошибка создания потока планировщика");
+            free(a);
+            exit(1);
+        }
     }
     pthread_create(&clock_tid, NULL, clock_thread, NULL);
 

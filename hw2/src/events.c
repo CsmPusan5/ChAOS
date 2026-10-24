@@ -324,3 +324,111 @@ void print_summary(void) {
     }
     out("=====================================================\n");
 }
+
+/* Узел: отказ (если не на ремонте) или шаг восстановления.*/
+void node_work(Node *n, int t) {
+    if (n->status == NODE_FAILED) {
+        if (--n->repair_left <= 0) {
+            n->status = NODE_OK;
+            outf("[t=%3d] ВОССТАНОВЛЕНИЕ: узел %d снова доступен\n", t, n->id);
+        }
+        return;
+    }
+
+    if (fail_prob <= 0.0) return;
+    if ((double)rand() / (double)RAND_MAX >= fail_prob) return;
+
+    n->status = NODE_FAILED;
+    n->repair_left = repair_time;
+    stat_node_fails++;
+    outf("[t=%3d] ОТКАЗ: узел %d вышел из строя "
+         "(восстановление через %d тиков)\n", t, n->id, repair_time);
+
+    for (int k = 0; k < MAX_TASKS; k++) {
+        Task *task = &tasks[k];
+        if (task->status != RUNNING) continue;
+        if (!(task->used_mask & (1u << n->id))) continue;
+
+        alloc_give(task);
+        alloc_clear(task);
+        task->time_remaining = task->duration;
+        task->restart_count++;
+        task->status = WAITING;
+        stat_restart++;
+        outf("[t=%3d] ПРЕРВАНО: %s (id=%d) упало вместе с %d, "
+             "перезапуск с начала\n", t, task->name, task->id, n->id);
+    }
+}
+
+/* Задание: поступление (если время пришло) и завершение (если досрочно). */
+void task_work(Task *task, int t) {
+    if (task->status == WAITING && task->arrival_time == t) {
+        if (!can_ever_fit(task)) {
+            task->status = FAILED;
+            task->finish_time = t;
+            stat_failed++;
+            outf("[t=%3d] ОТКЛОНЕНО: задание %s (id=%d) превышает "
+                 "ресурсы центра\n", t, task->name, task->id);
+            return;
+        }
+        outf("[t=%3d] ПОСТУПИЛО: %s (id=%d) (ядра=%d память=%dГБ мощность=%dВт "
+             "время=%d приоритет=%d срок=%d группа=%s вытеснение=%s%s)\n",
+             t, task->name, task->id,
+             task->req_cores, task->req_ram, task->req_power,
+             task->duration, task->priority, task->deadline,
+             task->multi      ? "да" : "нет",
+             task->preempt    ? "да" : "нет",
+             task->checkpoint ? " (ckpt)" : "");
+    }
+
+    if (task->status == RUNNING && task->time_remaining <= 0) {
+        alloc_give(task);
+        alloc_clear(task);
+        task->status = DONE;
+        task->finish_time = t;
+        stat_done++;
+        if (task->start_time >= 0)
+            stat_wait_sum += task->start_time - task->arrival_time;
+        stat_turn_sum += t - task->arrival_time;
+
+        outf("[t=%3d] ЗАВЕРШЕНО: %s (id=%d) — ресурсы освобождены "
+             "(ожидание %d, пребывание %d)\n",
+             t, task->name, task->id,
+             task->start_time >= 0 ? task->start_time - task->arrival_time : 0,
+             t - task->arrival_time);
+    }
+}
+
+/* Планировщик: сортировка очереди и раздача ресурсов. */
+void scheduler_work(int t) {
+    int order[MAX_TASKS], n = 0;
+    for (int i = 0; i < MAX_TASKS; i++)
+        if (tasks[i].status == WAITING || tasks[i].status == PREEMPTED)
+            order[n++] = i;
+    qsort(order, (size_t)n, sizeof(int), cmp_jobs);
+
+    for (int k = 0; k < n; k++) {
+        int i = order[k];
+        Task *task = &tasks[i];
+        if (task->status != WAITING && task->status != PREEMPTED) continue;
+
+        if (try_place_task(task)) {
+            task->status = RUNNING;
+            if (task->start_time < 0) task->start_time = t;
+            log_start(task, t);
+            continue;
+        }
+        if (try_preempt(task, t)) {
+            task->status = RUNNING;
+            if (task->start_time < 0) task->start_time = t;
+            log_start(task, t);
+        }
+    }
+
+    for (int k = 0; k < n; k++) {
+        Task *task = &tasks[order[k]];
+        if (task->status == WAITING || task->status == PREEMPTED)
+            outf("[t=%3d] ОЖИДАЕТ: %s (id=%d) — нет совместимых "
+                 "свободных ресурсов\n", t, task->name, task->id);
+    }
+}

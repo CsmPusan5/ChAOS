@@ -155,6 +155,9 @@ void advance(void);
 void status(int t);
 int  all_done(void);
 void print_summary(void);
+void node_work(Node *n, int t);
+void task_work(Task *task, int t);
+void scheduler_work(int t);
 
 /* ---------- config.c ---------- */
 Node create_node(int ID);

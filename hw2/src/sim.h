@@ -124,6 +124,12 @@ extern sem_t task_sem[MAX_TASKS];        /* фаза «задания»         
 extern sem_t sched_sem;                  /* фаза «планировщик»            */
 extern sem_t ack_sem;                    /* квитанции о завершении фазы   */
 
+typedef struct { int type; int index; } WorkerArg;
+/* type: 1 = узел, 2 = задание, 3 = планировщик */
+
+void *clock_thread (void *arg);
+void *worker_thread(void *arg);
+
 /* ---------- output.c ---------- */
 void out(const char *s);
 void outf(const char *fmt, ...);

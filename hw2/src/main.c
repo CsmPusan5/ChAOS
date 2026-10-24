@@ -74,6 +74,87 @@ static void usage(const char *prog)
         "  -h        эта справка\n", prog);
 }
 
+/* ---------- рабочий поток ---------- */
+void *worker_thread(void *arg) {
+    WorkerArg *w = (WorkerArg *)arg;
+    sem_t *my_sem = (w->type == 1) ? &node_sem[w->index]
+                  : (w->type == 2) ? &task_sem[w->index]
+                  :                  &sched_sem;
+
+    for (;;) {
+        sem_wait(my_sem);
+        if (stop_flag) {
+            sem_post(&ack_sem);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&mtx);
+        int t = cur_time;
+        if (w->type == 1)
+            node_work(&center.nodes[w->index], t);
+        else if (w->type == 2)
+            task_work(&tasks[w->index], t);
+        else
+            scheduler_work(t);
+        pthread_mutex_unlock(&mtx);
+
+        sem_post(&ack_sem);
+    }
+}
+
+/* --------- тактовый генератор ---------- */
+void *clock_thread(void *arg) {
+    (void)arg;
+
+    for (int t = 0; ; t++) {
+        if (stop_flag) {
+            outf("\n[t=%3d] ПРЕРВАНО ПОЛЬЗОВАТЕЛЕМ\n", t);
+            break;
+        }
+        if (time_limit > 0 && t >= time_limit) {
+            outf("\n[t=%3d] ПЕРИОД ЗАВЕРШЕН\n", t);
+            break;
+        }
+        if (t > 0) {
+            pthread_mutex_lock(&mtx);
+            int done = all_done();
+            pthread_mutex_unlock(&mtx);
+            if (done) {
+                outf("\n[t=%3d] ВСЕ ЗАДАНИЯ ОБРАБОТАНЫ\n", t);
+                break;
+            }
+        }
+
+        cur_time = t;
+
+        /* Фаза 1: узлы */
+        for (int i = 0; i < MAX_NODES; i++) sem_post(&node_sem[i]);
+        for (int i = 0; i < MAX_NODES; i++) sem_wait(&ack_sem);
+
+        /* Фаза 2: задания */
+        for (int i = 0; i < MAX_TASKS; i++) sem_post(&task_sem[i]);
+        for (int i = 0; i < MAX_TASKS; i++) sem_wait(&ack_sem);
+
+        /* Фаза 3: планировщик */
+        sem_post(&sched_sem);
+        sem_wait(&ack_sem);
+
+        if (verbose) {
+            pthread_mutex_lock(&mtx);
+            status(t);
+            pthread_mutex_unlock(&mtx);
+        }
+        delay_ms(tick_delay_ms);
+    }
+
+    /* Разбудить всех — они увидят stop_flag и выйдут */
+    stop_flag = 1;
+    for (int i = 0; i < MAX_NODES; i++) sem_post(&node_sem[i]);
+    for (int i = 0; i < MAX_TASKS; i++) sem_post(&task_sem[i]);
+    sem_post(&sched_sem);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     const char *log_path = "log.log";

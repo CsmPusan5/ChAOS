@@ -151,13 +151,6 @@ int try_preempt(Task *task, int t);
 
 /* ---------- events.c ---------- */
 int  can_ever_fit(Task *task);
-void arrivals(int t);
-void do_repairs(int t);
-void completion(int t);
-void schedule(int t);
-void check_deadlines(int t);
-void do_failures(int t);
-void advance(void);
 void status(int t);
 int  all_done(void);
 void print_summary(void);

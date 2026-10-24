@@ -139,6 +139,26 @@ void *clock_thread(void *arg) {
         sem_post(&sched_sem);
         sem_wait(&ack_sem);
 
+        /* Проверка просроченных дедлайнов */
+        pthread_mutex_lock(&mtx);
+        for (int i = 0; i < MAX_TASKS; i++) {
+            Task *task = &tasks[i];
+            if ((task->status == WAITING || task->status == PREEMPTED) &&
+                task->deadline > 0 && t > task->deadline) {
+                task->status = FAILED;
+                task->finish_time = t;
+                stat_failed++;
+                outf("[t=%3d] ОТКЛОНЕНО: у %s (id=%d) истёк срок (%d)\n",
+                     t, task->name, task->id, task->deadline);
+                }
+        }
+        /* Декремент времени выполнения и накопление энергии */
+        for (int i = 0; i < MAX_TASKS; i++)
+            if (tasks[i].status == RUNNING)
+                tasks[i].time_remaining--;
+        stat_energy += total_power();
+        pthread_mutex_unlock(&mtx);
+
         if (verbose) {
             pthread_mutex_lock(&mtx);
             status(t);

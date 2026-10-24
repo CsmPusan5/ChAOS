@@ -158,7 +158,6 @@ void *clock_thread(void *arg) {
 int main(int argc, char **argv)
 {
     const char *log_path = "log.log";
-    int t;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -217,33 +216,30 @@ int main(int argc, char **argv)
     out("Ctrl+C - прервать с сохранением лога.\n");
     out("------------------------------------------------------\n");
 
-    for (t = 0; ; t++) {
-        cur_time = t;
+    pthread_t clock_tid, sched_tid;
+    pthread_t node_tid[MAX_NODES], task_tid[MAX_TASKS];
 
-        if (stop_flag) {
-            outf("\n[t=%3d] ПРЕРВАНО ПОЛЬЗОВАТЕЛЕМ\n", t);
-            break;
-        }
-        if (time_limit > 0 && t >= time_limit) {
-            outf("\n[t=%3d] ПЕРИОД ЗАВЕРШЕН\n", t);
-            break;
-        }
-        if (t > 0 && all_done()) {
-            outf("\n[t=%3d] ВСЕ ЗАДАНИЯ ОБРАБОТАНЫ\n", t);
-            break;
-        }
-
-        arrivals(t);
-        do_repairs(t);
-        completion(t);
-        schedule(t);
-        check_deadlines(t);
-        do_failures(t);
-        advance();
-
-        if (verbose) status(t);
-        delay_ms(tick_delay_ms);
+    for (int i = 0; i < MAX_NODES; i++) {
+        WorkerArg *a = malloc(sizeof(WorkerArg));
+        a->type = 1; a->index = i;
+        pthread_create(&node_tid[i], NULL, worker_thread, a);
     }
+    for (int i = 0; i < MAX_TASKS; i++) {
+        WorkerArg *a = malloc(sizeof(WorkerArg));
+        a->type = 2; a->index = i;
+        pthread_create(&task_tid[i], NULL, worker_thread, a);
+    }
+    {
+        WorkerArg *a = malloc(sizeof(WorkerArg));
+        a->type = 3; a->index = 0;
+        pthread_create(&sched_tid, NULL, worker_thread, a);
+    }
+    pthread_create(&clock_tid, NULL, clock_thread, NULL);
+
+    pthread_join(clock_tid, NULL);
+    for (int i = 0; i < MAX_NODES; i++) pthread_join(node_tid[i], NULL);
+    for (int i = 0; i < MAX_TASKS; i++) pthread_join(task_tid[i], NULL);
+    pthread_join(sched_tid, NULL);
 
     print_summary();
 

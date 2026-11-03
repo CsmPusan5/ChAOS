@@ -37,6 +37,99 @@ static const char *strategy_name(void)
     return "?";
 }
 
+static const char *sem_mode_name(void) {
+    return shm->sem_mode == 0
+         ? "shm (неименованные POSIX-семафоры в разделяемой памяти)"
+         : "named (именованные POSIX-семафоры)";
+}
+
+/* ---------- Семафоры: два взаимозаменяемых режима ---------- */
+static int sems_init(int mode) {
+    shm->sem_mode = mode;
+
+    if (mode == 0) { /* Неименнованные */
+        if (sem_init(&shm->sem_mtx_emb, 1, 1) < 0) return -1;
+        shm->sem_mtx_p = &shm->sem_mtx_emb;
+
+        for (int i = 0; i < MAX_NODES; i++) {
+            if (sem_init(&shm->node_sem_emb[i], 1, 0) < 0) return -1;
+            shm->node_sem_p[i] = &shm->node_sem_emb[i];
+        }
+        for (int i = 0; i < MAX_TASKS; i++) {
+            if (sem_init(&shm->task_sem_emb[i], 1, 0) < 0) return -1;
+            shm->task_sem_p[i] = &shm->task_sem_emb[i];
+        }
+        if (sem_init(&shm->sched_sem_emb, 1, 0) < 0) return -1;
+        shm->sched_sem_p = &shm->sched_sem_emb;
+        if (sem_init(&shm->ack_sem_emb, 1, 0) < 0) return -1;
+        shm->ack_sem_p = &shm->ack_sem_emb;
+        return 0;
+    }
+
+    /* Именованные семафоры */
+    snprintf(shm->sem_prefix, sizeof shm->sem_prefix,
+             "/sim_%d", (int)getpid());
+
+    char nm[64];
+
+    #define OPEN_NAMED(DST, NAME, VAL) do {                             \
+        sem_unlink(NAME);                                                \
+        (DST) = sem_open((NAME), O_CREAT | O_EXCL, 0644, (VAL));         \
+        if ((DST) == SEM_FAILED) { perror("sem_open"); return -1; }      \
+    } while (0)
+
+    snprintf(nm, sizeof nm, "%s_mtx", shm->sem_prefix);
+    OPEN_NAMED(shm->sem_mtx_p, nm, 1);
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        snprintf(nm, sizeof nm, "%s_node%d", shm->sem_prefix, i);
+        OPEN_NAMED(shm->node_sem_p[i], nm, 0);
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {
+        snprintf(nm, sizeof nm, "%s_task%d", shm->sem_prefix, i);
+        OPEN_NAMED(shm->task_sem_p[i], nm, 0);
+    }
+    snprintf(nm, sizeof nm, "%s_sched", shm->sem_prefix);
+    OPEN_NAMED(shm->sched_sem_p, nm, 0);
+    snprintf(nm, sizeof nm, "%s_ack", shm->sem_prefix);
+    OPEN_NAMED(shm->ack_sem_p, nm, 0);
+
+    #undef OPEN_NAMED
+    return 0;
+}
+
+static void sems_destroy(void) {
+    if (shm->sem_mode == 0) {
+        sem_destroy(&shm->sem_mtx_emb);
+        for (int i = 0; i < MAX_NODES; i++) sem_destroy(&shm->node_sem_emb[i]);
+        for (int i = 0; i < MAX_TASKS; i++) sem_destroy(&shm->task_sem_emb[i]);
+        sem_destroy(&shm->sched_sem_emb);
+        sem_destroy(&shm->ack_sem_emb);
+    } else {
+        char nm[64];
+        sem_close(shm->sem_mtx_p);
+        for (int i = 0; i < MAX_NODES; i++) sem_close(shm->node_sem_p[i]);
+        for (int i = 0; i < MAX_TASKS; i++) sem_close(shm->task_sem_p[i]);
+        sem_close(shm->sched_sem_p);
+        sem_close(shm->ack_sem_p);
+
+        snprintf(nm, sizeof nm, "%s_mtx", shm->sem_prefix);
+        sem_unlink(nm);
+        for (int i = 0; i < MAX_NODES; i++) {
+            snprintf(nm, sizeof nm, "%s_node%d", shm->sem_prefix, i);
+            sem_unlink(nm);
+        }
+        for (int i = 0; i < MAX_TASKS; i++) {
+            snprintf(nm, sizeof nm, "%s_task%d", shm->sem_prefix, i);
+            sem_unlink(nm);
+        }
+        snprintf(nm, sizeof nm, "%s_sched", shm->sem_prefix);
+        sem_unlink(nm);
+        snprintf(nm, sizeof nm, "%s_ack", shm->sem_prefix);
+        sem_unlink(nm);
+    }
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -47,6 +140,9 @@ static void usage(const char *prog)
         "  -n seed   зерно генератора\n"
         "  -l файл   файл протокола (по умолчанию log.log)\n"
         "  -f p      вероятность отказа узла за тик (0..1)\n"
+        "  -m mode   синхронизация: shm | named\n"
+        "            shm   — неименованные POSIX-семафоры в shm (по умолчанию)\n"
+        "            named — именованные POSIX-семафоры (sem_open)\n"
         "  -q        не выводить статус каждый тик\n"
         "  -h        эта справка\n", prog);
 }
@@ -70,9 +166,9 @@ static int wait_ack_or_stop(void) {
 
 /* ---------- Рабочий процесс ---------- */
 int worker_process(WorkerArg w) {
-    sem_t *my_sem = (w.type == 1) ? &node_sem[w.index]
-                  : (w.type == 2) ? &task_sem[w.index]
-                  :                  sched_sem;
+    sem_t *my_sem = (w.type == 1) ? node_sem[w.index]
+              :     (w.type == 2) ? task_sem[w.index]
+              :                  sched_sem;
 
     for (;;) {
         sem_wait(my_sem);
@@ -118,12 +214,12 @@ void run_clock(void) {
         sem_post(sem_mtx);
 
         /* Фаза 1: узлы */
-        for (int i = 0; i < MAX_NODES; i++) sem_post(&node_sem[i]);
+        for (int i = 0; i < MAX_NODES; i++) sem_post(node_sem[i]);
         for (int i = 0; i < MAX_NODES; i++)
             if (wait_ack_or_stop() < 0) return;
 
         /* Фаза 2: задания */
-        for (int i = 0; i < MAX_TASKS; i++) sem_post(&task_sem[i]);
+        for (int i = 0; i < MAX_TASKS; i++) sem_post(task_sem[i]);
         for (int i = 0; i < MAX_TASKS; i++)
             if (wait_ack_or_stop() < 0) return;
 
@@ -169,6 +265,7 @@ int main(int argc, char **argv) {
     double     def_fail       = 0.0;
     int        def_repair     = 3;
     int        def_preempt    = 1;
+    int        def_sem_mode   = 0;
     const char *log_path      = "log.log";
 
     for (int i = 1; i < argc; i++) {
@@ -184,6 +281,14 @@ int main(int argc, char **argv) {
             def_fail = atof(argv[++i]);
             if (def_fail < 0.0) def_fail = 0.0;
             if (def_fail > 1.0) def_fail = 1.0;
+        } else if (!strcmp(argv[i], "-m") && i + 1 < argc) {
+            const char *mm = argv[++i];
+            if      (!strcmp(mm, "shm"))   def_sem_mode = 0;
+            else if (!strcmp(mm, "named")) def_sem_mode = 1;
+            else {
+                fprintf(stderr, "-m: ожидается shm | named\n");
+                return 1;
+            }
         } else if (!strcmp(argv[i], "-q")) def_verbose = 0;
         else {
             fprintf(stderr, "Неизвестный ключ: %s\n", argv[i]);
@@ -204,7 +309,7 @@ int main(int argc, char **argv) {
     if (shm == MAP_FAILED) {
         perror("mmap"); shm_unlink(SHM_NAME); return 1;
     }
-    shm_unlink(SHM_NAME); 
+    shm_unlink(SHM_NAME);
 
     memset(shm, 0, sizeof(*shm));
     time_limit    = def_time_limit;
@@ -215,14 +320,13 @@ int main(int argc, char **argv) {
     repair_time   = def_repair;
     allow_preempt = def_preempt;
 
-    /* ---- Неименованные POSIX-семафоры в разделяемой памяти ---- */
-    if (sem_init(sem_mtx, 1, 1) < 0) { perror("sem_init mtx");   return 1; }
-    for (int i = 0; i < MAX_NODES; i++)
-        if (sem_init(&node_sem[i], 1, 0) < 0) { perror("sem_init node"); return 1; }
-    for (int i = 0; i < MAX_TASKS; i++)
-        if (sem_init(&task_sem[i], 1, 0) < 0) { perror("sem_init task"); return 1; }
-    if (sem_init(sched_sem, 1, 0) < 0) { perror("sem_init sched"); return 1; }
-    if (sem_init(ack_sem,   1, 0) < 0) { perror("sem_init ack");   return 1; }
+    /* ---- Семафоры: выбранный вариант синхронизации ---- */
+    if (sems_init(def_sem_mode) < 0) {
+        fprintf(stderr, "Не удалось инициализировать семафоры (mode=%d)\n",
+                def_sem_mode);
+        munmap(shm, sizeof(SharedState));
+        return 1;
+    }
 
     /* ---- Журнал: O_APPEND — атомарные дописывания из разных процессов ---- */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
@@ -243,6 +347,7 @@ int main(int argc, char **argv) {
     outf("Вероятность отказа: %.4f за тик, восстановление %d тиков\n",
          fail_prob, repair_time);
     outf("Вытеснение разрешено: %s\n", allow_preempt ? "да" : "нет");
+    outf("Механизм синхронизации: %s\n", sem_mode_name());
     out("Ctrl+C - прервать с сохранением лога.\n");
     out("------------------------------------------------------\n");
 
@@ -298,8 +403,8 @@ int main(int argc, char **argv) {
 finish:
     /* Разбудить всех, кто ещё ждёт свою фазу, и дождаться */
     stop_flag = 1;
-    for (int i = 0; i < MAX_NODES; i++) sem_post(&node_sem[i]);
-    for (int i = 0; i < MAX_TASKS; i++) sem_post(&task_sem[i]);
+    for (int i = 0; i < MAX_NODES; i++) sem_post(node_sem[i]);
+    for (int i = 0; i < MAX_TASKS; i++) sem_post(task_sem[i]);
     sem_post(sched_sem);
 
     for (int i = 0; i < MAX_NODES; i++) if (pid_node[i] > 0) waitpid(pid_node[i], NULL, 0);
@@ -310,11 +415,7 @@ finish:
 
     /* ---- Удаление семафоров и разделяемой памяти ---- */
     if (log_fd >= 0) close(log_fd);
-    sem_destroy(sem_mtx);
-    for (int i = 0; i < MAX_NODES; i++) sem_destroy(&node_sem[i]);
-    for (int i = 0; i < MAX_TASKS; i++) sem_destroy(&task_sem[i]);
-    sem_destroy(sched_sem);
-    sem_destroy(ack_sem);
+    sems_destroy();
     munmap(shm, sizeof(SharedState));
     shm = NULL;
 

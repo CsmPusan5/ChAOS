@@ -107,11 +107,22 @@ typedef struct {
     double stat_energy;
     long long stat_wait_sum, stat_turn_sum;
 
-    sem_t sem_mtx;
-    sem_t node_sem[MAX_NODES];
-    sem_t task_sem[MAX_TASKS];
-    sem_t sched_sem;
-    sem_t ack_sem;
+    int  sem_mode;
+    char sem_prefix[32];
+
+    /* Встроенные семафоры (режим 0) */
+    sem_t sem_mtx_emb;
+    sem_t node_sem_emb[MAX_NODES];
+    sem_t task_sem_emb[MAX_TASKS];
+    sem_t sched_sem_emb;
+    sem_t ack_sem_emb;
+
+    /* Активные указатели (в 0 → *_emb, в 1 → sem_open) */
+    sem_t *sem_mtx_p;
+    sem_t *node_sem_p[MAX_NODES];
+    sem_t *task_sem_p[MAX_TASKS];
+    sem_t *sched_sem_p;
+    sem_t *ack_sem_p;
 } SharedState;
 
 extern SharedState *shm;
@@ -137,11 +148,11 @@ extern int log_fd;
 #define stat_wait_sum   (shm->stat_wait_sum)
 #define stat_turn_sum   (shm->stat_turn_sum)
 
-#define sem_mtx         (&shm->sem_mtx)
-#define node_sem        (shm->node_sem)
-#define task_sem        (shm->task_sem)
-#define sched_sem       (&shm->sched_sem)
-#define ack_sem         (&shm->ack_sem)
+#define sem_mtx         (shm->sem_mtx_p)
+#define node_sem        (shm->node_sem_p)
+#define task_sem        (shm->task_sem_p)
+#define sched_sem       (shm->sched_sem_p)
+#define ack_sem         (shm->ack_sem_p)
 
 typedef struct { int type; int index; } WorkerArg;
 /* type: 1 = узел, 2 = задание, 3 = планировщик */

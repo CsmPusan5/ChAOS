@@ -26,6 +26,20 @@ int can_ever_fit(Task *task) {
         }
         return 0;
     }
+
+    int m_count = 0, m_cores = 0, m_ram = 0, m_power = 0;
+    for (int i = 0; i < MAX_NODES; i++) {
+        Node *n = &center.nodes[i];
+        if (!n->multi) continue;
+        m_count++;
+        m_cores += n->max_cores;
+        m_ram   += n->max_ram;
+        m_power += n->max_power;
+    }
+    if (m_count == 0) return 0;
+    if (task->req_cores > m_cores) return 0;
+    if (task->req_ram   > m_ram)   return 0;
+    if (task->req_power > m_power) return 0;
     return 1;
 }
 
@@ -256,7 +270,7 @@ void task_work(Task *task, int t) {
 void scheduler_work(int t) {
     int order[MAX_TASKS], n = 0;
     for (int i = 0; i < MAX_TASKS; i++)
-        if (tasks[i].status == WAITING || tasks[i].status == PREEMPTED)
+        if ((tasks[i].status == WAITING || tasks[i].status == PREEMPTED) && tasks[i].arrival_time <= t)
             order[n++] = i;
     qsort(order, (size_t)n, sizeof(int), cmp_jobs);
 

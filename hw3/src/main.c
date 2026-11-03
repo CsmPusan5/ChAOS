@@ -145,14 +145,26 @@ void *clock_thread(void *arg) {
         pthread_mutex_lock(&mtx);
         for (int i = 0; i < MAX_TASKS; i++) {
             Task *task = &tasks[i];
-            if ((task->status == WAITING || task->status == PREEMPTED) &&
-                task->deadline > 0 && t > task->deadline) {
-                task->status = FAILED;
+            if (task->deadline <= 0) continue;
+            if (task->status == DONE || task->status == FAILED) continue;
+            if (t <= task->deadline) continue;
+            if (task->status == RUNNING) {
+                alloc_give(task);
+                alloc_clear(task);
                 task->finish_time = t;
+                task->status = FAILED;
+                stat_failed++;
+                outf("[t=%3d] ПРОСРОЧЕНО: %s (id=%d) снято с выполнения "
+                     "(дедлайн %d, остаток %d тиков)\n",
+                     t, task->name, task->id, task->deadline,
+                     task->time_remaining);
+            } else {
+                task->finish_time = t;
+                task->status = FAILED;
                 stat_failed++;
                 outf("[t=%3d] ОТКЛОНЕНО: у %s (id=%d) истёк срок (%d)\n",
                      t, task->name, task->id, task->deadline);
-                }
+            }
         }
         /* Декремент времени выполнения и накопление энергии */
         for (int i = 0; i < MAX_TASKS; i++)

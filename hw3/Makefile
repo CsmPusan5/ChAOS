@@ -1,6 +1,6 @@
 CC      = gcc
 CFLAGS  = -std=c11 -Wall -Wextra -O2 -D_GNU_SOURCE -pthread
-LDFLAGS = -pthread
+LDFLAGS = -pthread -lrt
 
 SRC_DIR   = src
 BUILD_DIR = build

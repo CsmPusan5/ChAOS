@@ -14,7 +14,12 @@
 SharedState *shm = NULL;
 int       log_fd = -1;
 
-static const char *SHM_NAME = "/sim_shm_v1";
+/* Process-local указатели на активные семафоры */
+sem_t *sem_mtx_p      = NULL;
+sem_t *node_sem_p[MAX_NODES] = {0};
+sem_t *task_sem_p[MAX_TASKS] = {0};
+sem_t *sched_sem_p    = NULL;
+sem_t *ack_sem_p      = NULL;
 
 /* ---------- Разбор стратегии ---------- */
 static int parse_strategy(const char *s)
@@ -47,22 +52,22 @@ static const char *sem_mode_name(void) {
 static int sems_init(int mode) {
     shm->sem_mode = mode;
 
-    if (mode == 0) { /* Неименнованные */
+    if (mode == 0) { /* Неименованные */
         if (sem_init(&shm->sem_mtx_emb, 1, 1) < 0) return -1;
-        shm->sem_mtx_p = &shm->sem_mtx_emb;
+        sem_mtx_p = &shm->sem_mtx_emb;
 
         for (int i = 0; i < MAX_NODES; i++) {
             if (sem_init(&shm->node_sem_emb[i], 1, 0) < 0) return -1;
-            shm->node_sem_p[i] = &shm->node_sem_emb[i];
+            node_sem_p[i] = &shm->node_sem_emb[i];
         }
         for (int i = 0; i < MAX_TASKS; i++) {
             if (sem_init(&shm->task_sem_emb[i], 1, 0) < 0) return -1;
-            shm->task_sem_p[i] = &shm->task_sem_emb[i];
+            task_sem_p[i] = &shm->task_sem_emb[i];
         }
         if (sem_init(&shm->sched_sem_emb, 1, 0) < 0) return -1;
-        shm->sched_sem_p = &shm->sched_sem_emb;
+        sched_sem_p = &shm->sched_sem_emb;
         if (sem_init(&shm->ack_sem_emb, 1, 0) < 0) return -1;
-        shm->ack_sem_p = &shm->ack_sem_emb;
+        ack_sem_p = &shm->ack_sem_emb;
         return 0;
     }
 
@@ -72,27 +77,27 @@ static int sems_init(int mode) {
 
     char nm[64];
 
-    #define OPEN_NAMED(DST, NAME, VAL) do {                             \
+    #define OPEN_NAMED(DST, NAME, VAL) do {                              \
         sem_unlink(NAME);                                                \
         (DST) = sem_open((NAME), O_CREAT | O_EXCL, 0644, (VAL));         \
         if ((DST) == SEM_FAILED) { perror("sem_open"); return -1; }      \
     } while (0)
 
     snprintf(nm, sizeof nm, "%s_mtx", shm->sem_prefix);
-    OPEN_NAMED(shm->sem_mtx_p, nm, 1);
+    OPEN_NAMED(sem_mtx_p, nm, 1);
 
     for (int i = 0; i < MAX_NODES; i++) {
         snprintf(nm, sizeof nm, "%s_node%d", shm->sem_prefix, i);
-        OPEN_NAMED(shm->node_sem_p[i], nm, 0);
+        OPEN_NAMED(node_sem_p[i], nm, 0);
     }
     for (int i = 0; i < MAX_TASKS; i++) {
         snprintf(nm, sizeof nm, "%s_task%d", shm->sem_prefix, i);
-        OPEN_NAMED(shm->task_sem_p[i], nm, 0);
+        OPEN_NAMED(task_sem_p[i], nm, 0);
     }
     snprintf(nm, sizeof nm, "%s_sched", shm->sem_prefix);
-    OPEN_NAMED(shm->sched_sem_p, nm, 0);
+    OPEN_NAMED(sched_sem_p, nm, 0);
     snprintf(nm, sizeof nm, "%s_ack", shm->sem_prefix);
-    OPEN_NAMED(shm->ack_sem_p, nm, 0);
+    OPEN_NAMED(ack_sem_p, nm, 0);
 
     #undef OPEN_NAMED
     return 0;
@@ -107,11 +112,11 @@ static void sems_destroy(void) {
         sem_destroy(&shm->ack_sem_emb);
     } else {
         char nm[64];
-        sem_close(shm->sem_mtx_p);
-        for (int i = 0; i < MAX_NODES; i++) sem_close(shm->node_sem_p[i]);
-        for (int i = 0; i < MAX_TASKS; i++) sem_close(shm->task_sem_p[i]);
-        sem_close(shm->sched_sem_p);
-        sem_close(shm->ack_sem_p);
+        sem_close(sem_mtx_p);
+        for (int i = 0; i < MAX_NODES; i++) sem_close(node_sem_p[i]);
+        for (int i = 0; i < MAX_TASKS; i++) sem_close(task_sem_p[i]);
+        sem_close(sched_sem_p);
+        sem_close(ack_sem_p);
 
         snprintf(nm, sizeof nm, "%s_mtx", shm->sem_prefix);
         sem_unlink(nm);
@@ -130,19 +135,48 @@ static void sems_destroy(void) {
     }
 }
 
+/* Воркер: присоединиться к уже созданным именованным семафорам. */
+static int sems_attach_named(const char *prefix) {
+    char nm[64];
+
+#define ATTACH(NAME, DST) do {                                       \
+(DST) = sem_open((NAME), 0);                                     \
+if ((DST) == SEM_FAILED) { perror("sem_open(attach)"); return -1; } \
+} while (0)
+
+    snprintf(nm, sizeof nm, "%s_mtx", prefix);
+    ATTACH(nm, sem_mtx_p);
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        snprintf(nm, sizeof nm, "%s_node%d", prefix, i);
+        ATTACH(nm, node_sem_p[i]);
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {
+        snprintf(nm, sizeof nm, "%s_task%d", prefix, i);
+        ATTACH(nm, task_sem_p[i]);
+    }
+    snprintf(nm, sizeof nm, "%s_sched", prefix);
+    ATTACH(nm, sched_sem_p);
+    snprintf(nm, sizeof nm, "%s_ack", prefix);
+    ATTACH(nm, ack_sem_p);
+
+#undef ATTACH
+    return 0;
+}
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Использование: %s [опции]\n"
         "  -s str    стратегия: fcfs | prio | edf | sjf\n"
-        "  -d мс     задержка между тиками (0 — без задержки)\n"
+        "  -d мс     задержка между тиками (0 - без задержки)\n"
         "  -t тиков  период наблюдения\n"
         "  -n seed   зерно генератора\n"
         "  -l файл   файл протокола (по умолчанию log.log)\n"
         "  -f p      вероятность отказа узла за тик (0..1)\n"
         "  -m mode   синхронизация: shm | named\n"
-        "            shm   — неименованные POSIX-семафоры в shm (по умолчанию)\n"
-        "            named — именованные POSIX-семафоры (sem_open)\n"
+        "            shm   - неименованные POSIX-семафоры в shm (по умолчанию)\n"
+        "            named - именованные POSIX-семафоры (sem_open)\n"
         "  -q        не выводить статус каждый тик\n"
         "  -h        эта справка\n", prog);
 }
@@ -150,17 +184,21 @@ static void usage(const char *prog)
 /* ---------- Ожидание ack с реакцией на stop_flag (Ctrl+C) ---------- */
 static int wait_ack_or_stop(void) {
     struct timespec ts;
+    int idle = 0;
     for (;;) {
         if (stop_flag) return -1;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 100L * 1000000L; // 100 мс
+        ts.tv_nsec += 100L * 1000000L;
         if (ts.tv_nsec >= 1000000000L) {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
+            ts.tv_sec++; ts.tv_nsec -= 1000000000L;
         }
         if (sem_timedwait(ack_sem, &ts) == 0) return 0;
-        if (errno == ETIMEDOUT || errno == EINTR) continue;
-        return -1;
+        if (errno == EINTR) continue;
+        if (errno != ETIMEDOUT) return -1;
+        if (++idle > 50) {                    /* 5 секунд - воркер точно пропал */
+            fprintf(stderr, "wait_ack: ack не пришёл - прерываю такт\n");
+            return -1;
+        }
     }
 }
 
@@ -227,19 +265,30 @@ void run_clock(void) {
         sem_post(sched_sem);
         if (wait_ack_or_stop() < 0) return;
 
-        /* Дедлайны (как в исходной версии — только для не-RUNNING)
-         * и декремент времени выполнения, накопление энергии. */
         sem_wait(sem_mtx);
         for (int i = 0; i < MAX_TASKS; i++) {
             Task *task = &tasks[i];
-            if ((task->status == WAITING || task->status == PREEMPTED) &&
-                task->deadline > 0 && t > task->deadline) {
-                task->status = FAILED;
+            if (task->deadline <= 0) continue;
+            if (task->status == DONE || task->status == FAILED) continue;
+            if (t <= task->deadline) continue;
+
+            if (task->status == RUNNING) {
+                alloc_give(task);
+                alloc_clear(task);
                 task->finish_time = t;
+                task->status = FAILED;
+                stat_failed++;
+                outf("[t=%3d] ПРОСРОЧЕНО: %s (id=%d) снято с выполнения "
+                     "(дедлайн %d, остаток %d тиков)\n",
+                     t, task->name, task->id, task->deadline,
+                     task->time_remaining);
+            } else {
+                task->finish_time = t;
+                task->status = FAILED;
                 stat_failed++;
                 outf("[t=%3d] ОТКЛОНЕНО: у %s (id=%d) истёк срок (%d)\n",
                      t, task->name, task->id, task->deadline);
-                }
+            }
         }
         for (int i = 0; i < MAX_TASKS; i++)
             if (tasks[i].status == RUNNING)
@@ -256,7 +305,7 @@ void run_clock(void) {
     }
 }
 
-int main(int argc, char **argv) {
+static int cmd_legacy(int argc, char **argv) {
     int        def_time_limit = 60;
     int        def_tick_delay = 150;
     Strategies def_strat      = PRIO;
@@ -297,19 +346,22 @@ int main(int argc, char **argv) {
     }
 
     /* ---- Разделяемая память POSIX ---- */
-    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0644);
+    char shm_name[64];
+    snprintf(shm_name, sizeof shm_name, "/sim_shm_%d", (int)getpid());
+
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0644);
     if (shm_fd < 0) { perror("shm_open"); return 1; }
     if (ftruncate(shm_fd, sizeof(SharedState)) < 0) {
         perror("ftruncate"); close(shm_fd);
-        shm_unlink(SHM_NAME); return 1;
+        shm_unlink(shm_name); return 1;
     }
     shm = mmap(NULL, sizeof(SharedState),
                PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     close(shm_fd);
     if (shm == MAP_FAILED) {
-        perror("mmap"); shm_unlink(SHM_NAME); return 1;
+        perror("mmap"); shm_unlink(shm_name); return 1;
     }
-    shm_unlink(SHM_NAME);
+    shm_unlink(shm_name);
 
     memset(shm, 0, sizeof(*shm));
     time_limit    = def_time_limit;
@@ -328,7 +380,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* ---- Журнал: O_APPEND — атомарные дописывания из разных процессов ---- */
+    /* ---- Журнал: O_APPEND - атомарные дописывания из разных процессов ---- */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (log_fd < 0) fprintf(stderr, "Не удалось открыть файл %s\n", log_path);
 
@@ -352,7 +404,7 @@ int main(int argc, char **argv) {
     out("------------------------------------------------------\n");
 
     /* ---- Обработчики сигналов в родителе ---- */
-    struct sigaction sa;
+    struct sigaction sa = {0};
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
@@ -420,4 +472,277 @@ finish:
     shm = NULL;
 
     return success ? 0 : 1;
+}
+
+/* ============================================================
+ *  7-8 баллов: независимо запускаемые процессы.
+ * ============================================================ */
+
+#define ENV_SHM_NAME   "SIM_SHM_NAME"
+#define ENV_SEM_PREFIX "SIM_SEM_PREFIX"
+#define ENV_LOG_PATH   "SIM_LOG_PATH"
+
+/* ---- master ---- */
+static int cmd_cluster(int argc, char **argv) {
+    int        def_time_limit = 60;
+    int        def_tick_delay = 150;
+    Strategies def_strat      = PRIO;
+    int        def_verbose    = 1;
+    unsigned   def_seed       = 42u;
+    double     def_fail       = 0.0;
+    int        def_repair     = 3;
+    int        def_preempt    = 1;
+    const char *log_path      = "log.log";
+
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            usage(argv[0]); return 0;
+        }
+        if      (!strcmp(argv[i], "-s") && i + 1 < argc) def_strat      = parse_strategy(argv[++i]);
+        else if (!strcmp(argv[i], "-d") && i + 1 < argc) def_tick_delay = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) def_time_limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc) def_seed       = (unsigned)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) log_path       = argv[++i];
+        else if (!strcmp(argv[i], "-f") && i + 1 < argc) {
+            def_fail = atof(argv[++i]);
+            if (def_fail < 0.0) def_fail = 0.0;
+            if (def_fail > 1.0) def_fail = 1.0;
+        } else if (!strcmp(argv[i], "-q")) def_verbose = 0;
+        else {
+            fprintf(stderr, "Неизвестный ключ: %s\n", argv[i]);
+            usage(argv[0]); return 1;
+        }
+    }
+
+    /* ---- shm с уникальным именем ---- */
+    char shm_name[64];
+    snprintf(shm_name, sizeof shm_name, "/sim_shm_%d", (int)getpid());
+
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0644);
+    if (shm_fd < 0) { perror("shm_open"); return 1; }
+    if (ftruncate(shm_fd, sizeof(SharedState)) < 0) {
+        perror("ftruncate"); close(shm_fd);
+        shm_unlink(shm_name); return 1;
+    }
+    shm = mmap(NULL, sizeof(SharedState),
+               PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (shm == MAP_FAILED) {
+        perror("mmap"); shm_unlink(shm_name); return 1;
+    }
+
+    memset(shm, 0, sizeof(*shm));
+    time_limit    = def_time_limit;
+    tick_delay_ms = def_tick_delay;
+    strategy      = def_strat;
+    verbose       = def_verbose;
+    fail_prob     = def_fail;
+    repair_time   = def_repair;
+    allow_preempt = def_preempt;
+
+    /* ---- именованные семафоры (только режим 1) ---- */
+    if (sems_init(1) < 0) {
+        fprintf(stderr, "Не удалось создать именованные семафоры\n");
+        munmap(shm, sizeof(SharedState));
+        shm_unlink(shm_name);
+        return 1;
+    }
+
+    /* ---- журнал ---- */
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+
+    /* ---- генерация конфигурации ---- */
+    srand(def_seed);
+    init_simulation();
+
+    out("======================================================\n");
+    out("  МОДЕЛЬ ВЫЧИСЛИТЕЛЬНОГО ЦЕНТРА (независимые процессы)\n");
+    out("======================================================\n");
+    outf("Мастер PID   : %d\n", (int)getpid());
+    outf("SHM имя      : %s\n", shm_name);
+    outf("SEM префикс  : %s\n", shm->sem_prefix);
+    outf("Узлов: %d, заданий: %d\n", MAX_NODES, MAX_TASKS);
+    outf("Стратегия: %s, период: %d тиков, задержка: %d мс\n",
+         strategy_name(), time_limit, tick_delay_ms);
+    outf("Вероятность отказа: %.4f за тик, восстановление %d тиков\n",
+         fail_prob, repair_time);
+    outf("Синхронизация: именованные POSIX-семафоры + POSIX shm\n");
+    out("Для ручного запуска воркера в другом терминале:\n");
+    outf("  export %s=%s\n", ENV_SHM_NAME, shm_name);
+    outf("  export %s=%s\n", ENV_SEM_PREFIX, shm->sem_prefix);
+    outf("  export %s=%s\n", ENV_LOG_PATH, log_path);
+    out("  ./sim worker node 0     # или task 3 / sched\n");
+    out("Ctrl+C - прервать с сохранением лога.\n");
+    out("------------------------------------------------------\n");
+
+    /* ---- сигналы ---- */
+    struct sigaction sa = {0};
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    /* ---- проброс env воркерам и fork+exec ---- */
+    setenv(ENV_SHM_NAME,   shm_name,        1);
+    setenv(ENV_SEM_PREFIX, shm->sem_prefix, 1);
+    setenv(ENV_LOG_PATH,   log_path,        1);
+
+    pid_t pid_node[MAX_NODES] = {0};
+    pid_t pid_task[MAX_TASKS] = {0};
+    pid_t pid_sched = 0;
+    int   success   = 1;
+
+    const char *self = "/proc/self/exe";
+
+    #define SPAWN(PID, ROLE, IDX) do {                                   \
+        (PID) = fork();                                                  \
+        if ((PID) < 0) { perror("fork"); success = 0; goto finish; }     \
+        if ((PID) == 0) {                                                \
+            char idx_s[16];                                              \
+            snprintf(idx_s, sizeof idx_s, "%d", (IDX));                  \
+            execl(self, "sim", "worker", (ROLE), idx_s, (char *)NULL);   \
+            perror("execl"); _exit(127);                                 \
+        }                                                                \
+    } while (0)
+
+    for (int i = 0; i < MAX_NODES; i++) SPAWN(pid_node[i], "node", i);
+    for (int i = 0; i < MAX_TASKS; i++) SPAWN(pid_task[i], "task", i);
+    SPAWN(pid_sched, "sched", 0);
+
+    #undef SPAWN
+
+    /* ---- тактовый генератор ---- */
+    run_clock();
+
+finish:
+    stop_flag = 1;
+    for (int i = 0; i < MAX_NODES; i++) sem_post(node_sem[i]);
+    for (int i = 0; i < MAX_TASKS; i++) sem_post(task_sem[i]);
+    sem_post(sched_sem);
+
+    for (int i = 0; i < MAX_NODES; i++) if (pid_node[i] > 0) waitpid(pid_node[i], NULL, 0);
+    for (int i = 0; i < MAX_TASKS; i++) if (pid_task[i] > 0) waitpid(pid_task[i], NULL, 0);
+    if (pid_sched > 0) waitpid(pid_sched, NULL, 0);
+
+    if (success) print_summary();
+
+    if (log_fd >= 0) close(log_fd);
+    sems_destroy();
+    munmap(shm, sizeof(SharedState));
+    shm = NULL;
+    shm_unlink(shm_name);
+
+    return success ? 0 : 1;
+}
+
+/* ---- worker ---- */
+static int cmd_worker(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "Использование: %s worker <node|task|sched> <idx>\n", argv[0]);
+        return 1;
+    }
+    const char *role = argv[2];
+    int idx = atoi(argv[3]);
+
+    const char *shm_name   = getenv(ENV_SHM_NAME);
+    const char *sem_prefix = getenv(ENV_SEM_PREFIX);
+    const char *log_path   = getenv(ENV_LOG_PATH);
+
+    if (!shm_name || !sem_prefix) {
+        fprintf(stderr,
+            "Не заданы %s / %s - запустите сначала master\n",
+            ENV_SHM_NAME, ENV_SEM_PREFIX);
+        return 1;
+    }
+
+    /* ---- shm: присоединяемся к существующей ---- */
+    int shm_fd = shm_open(shm_name, O_RDWR, 0644);
+    if (shm_fd < 0) { perror("shm_open(worker)"); return 1; }
+    shm = mmap(NULL, sizeof(SharedState),
+               PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    close(shm_fd);
+    if (shm == MAP_FAILED) { perror("mmap(worker)"); return 1; }
+
+    /* ---- семафоры: открываем существующие по именам ---- */
+    if (sems_attach_named(sem_prefix) < 0) {
+        munmap(shm, sizeof(SharedState));
+        return 1;
+    }
+
+    if (log_path)
+        log_fd = open(log_path, O_WRONLY | O_APPEND, 0644);
+
+    signal(SIGINT,  SIG_IGN);
+    signal(SIGTERM, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+
+    WorkerArg w = { 0, idx };
+    if      (!strcmp(role, "node"))  {
+        if (idx < 0 || idx >= MAX_NODES) {
+            fprintf(stderr, "worker: node idx должен быть 0..%d\n", MAX_NODES - 1);
+            munmap(shm, sizeof(SharedState));
+            return 1;
+        }
+        w.type = 1; srand(100000u + (unsigned)idx);
+    } else if (!strcmp(role, "task"))  {
+        if (idx < 0 || idx >= MAX_TASKS) {
+            fprintf(stderr, "worker: task idx должен быть 0..%d\n", MAX_TASKS - 1);
+            munmap(shm, sizeof(SharedState));
+            return 1;
+        }
+        w.type = 2; srand(200000u + (unsigned)idx);
+    } else if (!strcmp(role, "sched")) {
+        w.type = 3; srand(300000u);
+    } else {
+        fprintf(stderr, "worker: неизвестная роль %s\n", role);
+        munmap(shm, sizeof(SharedState));
+        return 1;
+    }
+
+    int rc = worker_process(w);
+
+    sem_close(sem_mtx_p);
+    for (int i = 0; i < MAX_NODES; i++) sem_close(node_sem_p[i]);
+    for (int i = 0; i < MAX_TASKS; i++) sem_close(task_sem_p[i]);
+    sem_close(sched_sem_p);
+    sem_close(ack_sem_p);
+    if (log_fd >= 0) close(log_fd);
+    munmap(shm, sizeof(SharedState));
+    return rc;
+}
+
+/* ---- stop: внешняя остановка ---- */
+static int cmd_stop(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Использование: %s stop <master_pid>\n", argv[0]);
+        return 1;
+    }
+    pid_t pid = (pid_t)atoi(argv[2]);
+    if (pid <= 0) { fprintf(stderr, "stop: неверный pid\n"); return 1; }
+    if (kill(pid, SIGTERM) < 0) { perror("kill"); return 1; }
+    fprintf(stderr, "SIGTERM -> %d\n", (int)pid);
+    return 0;
+}
+
+/* ---- обновлённый main: диспетчер подкоманд ---- */
+int main(int argc, char **argv) {
+    if (argc >= 2) {
+        if (!strcmp(argv[1], "cluster")) return cmd_cluster(argc, argv);
+        if (!strcmp(argv[1], "worker"))  return cmd_worker(argc, argv);
+        if (!strcmp(argv[1], "stop"))    return cmd_stop(argc, argv);
+        if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+            usage(argv[0]);
+            fprintf(stderr,
+                "\nПодкоманды (7-8 баллов):\n"
+                "  cluster [опции]           - мастер + fork/exec независимых воркеров\n"
+                "  worker <node|task|sched> <idx>\n"
+                "                            - воркер (запускается мастером или вручную)\n"
+                "  stop <master_pid>         - послать SIGTERM мастеру\n"
+                "\nБез подкоманды - версия на 4-5/6 баллов.\n");
+            return 0;
+        }
+    }
+    return cmd_legacy(argc, argv);
 }

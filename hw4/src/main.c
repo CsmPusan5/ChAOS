@@ -1,5 +1,6 @@
 /*  Точка входа: глобальные переменные, CLI, основной цикл. */
 #include "sim.h"
+#include "net.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +21,10 @@ sem_t *node_sem_p[MAX_NODES] = {0};
 sem_t *task_sem_p[MAX_TASKS] = {0};
 sem_t *sched_sem_p    = NULL;
 sem_t *ack_sem_p      = NULL;
+
+/* Клиент: shm не выделяется, on_signal (пишет shm->stop_flag) не подходит */
+static volatile sig_atomic_t client_stop = 0;
+static void on_signal_client(int s) { (void)s; client_stop = 1; }
 
 /* ---------- Разбор стратегии ---------- */
 static int parse_strategy(const char *s)
@@ -372,7 +377,6 @@ static int cmd_legacy(int argc, char **argv) {
     repair_time   = def_repair;
     allow_preempt = def_preempt;
 
-    /* ---- Семафоры: выбранный вариант синхронизации ---- */
     if (sems_init(def_sem_mode) < 0) {
         fprintf(stderr, "Не удалось инициализировать семафоры (mode=%d)\n",
                 def_sem_mode);
@@ -380,11 +384,9 @@ static int cmd_legacy(int argc, char **argv) {
         return 1;
     }
 
-    /* ---- Журнал: O_APPEND - атомарные дописывания из разных процессов ---- */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
     if (log_fd < 0) fprintf(stderr, "Не удалось открыть файл %s\n", log_path);
 
-    /* ---- Генерация исходных данных (в родителе, до fork) ---- */
     srand(def_seed);
     init_simulation();
 
@@ -403,16 +405,13 @@ static int cmd_legacy(int argc, char **argv) {
     out("Ctrl+C - прервать с сохранением лога.\n");
     out("------------------------------------------------------\n");
 
-    /* ---- Обработчики сигналов в родителе ---- */
     struct sigaction sa = {0};
-    memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    /* ---- Запуск дочерних процессов ---- */
     pid_t pid_node[MAX_NODES] = {0};
     pid_t pid_task[MAX_TASKS] = {0};
     pid_t pid_sched = 0;
@@ -453,7 +452,6 @@ static int cmd_legacy(int argc, char **argv) {
     run_clock();
 
 finish:
-    /* Разбудить всех, кто ещё ждёт свою фазу, и дождаться */
     stop_flag = 1;
     for (int i = 0; i < MAX_NODES; i++) sem_post(node_sem[i]);
     for (int i = 0; i < MAX_TASKS; i++) sem_post(task_sem[i]);
@@ -465,7 +463,6 @@ finish:
 
     if (success) print_summary();
 
-    /* ---- Удаление семафоров и разделяемой памяти ---- */
     if (log_fd >= 0) close(log_fd);
     sems_destroy();
     munmap(shm, sizeof(SharedState));
@@ -474,15 +471,10 @@ finish:
     return success ? 0 : 1;
 }
 
-/* ============================================================
- *  7-8 баллов: независимо запускаемые процессы.
- * ============================================================ */
-
 #define ENV_SHM_NAME   "SIM_SHM_NAME"
 #define ENV_SEM_PREFIX "SIM_SEM_PREFIX"
 #define ENV_LOG_PATH   "SIM_LOG_PATH"
 
-/* ---- master ---- */
 static int cmd_cluster(int argc, char **argv) {
     int        def_time_limit = 60;
     int        def_tick_delay = 150;
@@ -514,7 +506,6 @@ static int cmd_cluster(int argc, char **argv) {
         }
     }
 
-    /* ---- shm с уникальным именем ---- */
     char shm_name[64];
     snprintf(shm_name, sizeof shm_name, "/sim_shm_%d", (int)getpid());
 
@@ -540,7 +531,6 @@ static int cmd_cluster(int argc, char **argv) {
     repair_time   = def_repair;
     allow_preempt = def_preempt;
 
-    /* ---- именованные семафоры (только режим 1) ---- */
     if (sems_init(1) < 0) {
         fprintf(stderr, "Не удалось создать именованные семафоры\n");
         munmap(shm, sizeof(SharedState));
@@ -548,10 +538,8 @@ static int cmd_cluster(int argc, char **argv) {
         return 1;
     }
 
-    /* ---- журнал ---- */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
 
-    /* ---- генерация конфигурации ---- */
     srand(def_seed);
     init_simulation();
 
@@ -575,16 +563,13 @@ static int cmd_cluster(int argc, char **argv) {
     out("Ctrl+C - прервать с сохранением лога.\n");
     out("------------------------------------------------------\n");
 
-    /* ---- сигналы ---- */
     struct sigaction sa = {0};
-    memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    /* ---- проброс env воркерам и fork+exec ---- */
     setenv(ENV_SHM_NAME,   shm_name,        1);
     setenv(ENV_SEM_PREFIX, shm->sem_prefix, 1);
     setenv(ENV_LOG_PATH,   log_path,        1);
@@ -613,7 +598,6 @@ static int cmd_cluster(int argc, char **argv) {
 
     #undef SPAWN
 
-    /* ---- тактовый генератор ---- */
     run_clock();
 
 finish:
@@ -637,7 +621,6 @@ finish:
     return success ? 0 : 1;
 }
 
-/* ---- worker ---- */
 static int cmd_worker(int argc, char **argv) {
     if (argc < 4) {
         fprintf(stderr, "Использование: %s worker <node|task|sched> <idx>\n", argv[0]);
@@ -657,7 +640,6 @@ static int cmd_worker(int argc, char **argv) {
         return 1;
     }
 
-    /* ---- shm: присоединяемся к существующей ---- */
     int shm_fd = shm_open(shm_name, O_RDWR, 0644);
     if (shm_fd < 0) { perror("shm_open(worker)"); return 1; }
     shm = mmap(NULL, sizeof(SharedState),
@@ -665,7 +647,6 @@ static int cmd_worker(int argc, char **argv) {
     close(shm_fd);
     if (shm == MAP_FAILED) { perror("mmap(worker)"); return 1; }
 
-    /* ---- семафоры: открываем существующие по именам ---- */
     if (sems_attach_named(sem_prefix) < 0) {
         munmap(shm, sizeof(SharedState));
         return 1;
@@ -713,6 +694,476 @@ static int cmd_worker(int argc, char **argv) {
     return rc;
 }
 
+static void scheduler_work_with_arrival(int t) {
+    for (int i = 0; i < MAX_TASKS; i++)
+        if (tasks[i].status == WAITING && tasks[i].arrival_time > t)
+            tasks[i].status = (TaskStatus)99;
+    scheduler_work(t);
+    for (int i = 0; i < MAX_TASKS; i++)
+        if ((int)tasks[i].status == 99)
+            tasks[i].status = WAITING;
+}
+
+/* ---- server ---- */
+static int cmd_server(int argc, char **argv) {
+    int port = 0, spawn_all = 0;
+    int def_time_limit = 60, def_tick_delay = 150, def_verbose = 0;
+    unsigned def_seed = 42u;
+    double def_fail = 0.0;
+    Strategies def_strat = PRIO;
+    const char *log_path = "log_server.log";
+
+    for (int i = 2; i < argc; i++) {
+        if      (!strcmp(argv[i], "--port")      && i+1<argc) port           = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--spawn-all"))             spawn_all      = 1;
+        else if (!strcmp(argv[i], "-s")          && i+1<argc) def_strat      = parse_strategy(argv[++i]);
+        else if (!strcmp(argv[i], "-t")          && i+1<argc) def_time_limit = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-d")          && i+1<argc) def_tick_delay = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-n")          && i+1<argc) def_seed       = (unsigned)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "-f")          && i+1<argc) {
+            def_fail = atof(argv[++i]);
+            if (def_fail < 0.0) def_fail = 0.0;
+            if (def_fail > 1.0) def_fail = 1.0;
+        } else if (!strcmp(argv[i], "-l")        && i+1<argc) log_path       = argv[++i];
+        else { fprintf(stderr, "server: неизвестный ключ %s\n", argv[i]); return 1; }
+    }
+    if (port <= 0) { fprintf(stderr, "server: --port обязателен\n"); return 1; }
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+
+    shm = calloc(1, sizeof(SharedState));
+    time_limit    = def_time_limit;
+    tick_delay_ms = def_tick_delay;
+    strategy      = def_strat;
+    verbose       = def_verbose;
+    fail_prob     = def_fail;
+    repair_time   = 3;
+    allow_preempt = 1;
+
+    srand(def_seed);
+    init_simulation();
+
+    outf("SERVER: порт %d, стратегия %s, seed %u, время %d\n",
+         port, strategy_name(), def_seed, time_limit);
+
+    int listen_fd = net_listen(port, 64);
+    if (listen_fd < 0) { perror("listen"); free(shm); shm = NULL; return 1; }
+    fcntl(listen_fd, F_SETFD, FD_CLOEXEC);
+
+    int expected = MAX_NODES + MAX_TASKS;
+    pid_t children[MAX_NODES + MAX_TASKS];
+    int nchildren = 0;
+
+    if (spawn_all) {
+        for (int i = 0; i < MAX_NODES; i++) {
+            pid_t p = fork();
+            if (p < 0) { perror("fork node"); expected--; continue; }
+            if (p == 0) {
+                char ps[16], is[16];
+                snprintf(ps, sizeof ps, "%d", port);
+                snprintf(is, sizeof is, "%d", i);
+                execl("/proc/self/exe", "sim", "client", "--host", "127.0.0.1",
+                      "--port", ps, "--type", "node", "--idx", is, (char*)NULL);
+                _exit(127);
+            }
+            children[nchildren++] = p;
+        }
+        for (int i = 0; i < MAX_TASKS; i++) {
+            pid_t p = fork();
+            if (p < 0) { perror("fork task"); expected--; continue; }
+            if (p == 0) {
+                char ps[16], is[16];
+                snprintf(ps, sizeof ps, "%d", port);
+                snprintf(is, sizeof is, "%d", i);
+                execl("/proc/self/exe", "sim", "client", "--host", "127.0.0.1",
+                      "--port", ps, "--type", "task", "--idx", is, (char*)NULL);
+                _exit(127);
+            }
+            children[nchildren++] = p;
+        }
+    }
+
+    int fd_node[MAX_NODES], fd_task[MAX_TASKS];
+    for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
+    for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
+
+    int accepted = 0;
+    while (accepted < expected && !stop_flag) {
+        int fd = net_accept(listen_fd);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            perror("accept"); break;
+        }
+
+        char line[256];
+        if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); continue; }
+        char type[16]; int idx;
+        if (sscanf(line, "HELLO %15s %d", type, &idx) != 2) { close(fd); continue; }
+
+        if (!strcmp(type, "node") && idx >= 0 && idx < MAX_NODES) {
+            fd_node[idx] = fd; accepted++;
+            Node *n = &center.nodes[idx];
+            net_send_line(fd, "INIT_NODE %d %d %d %d %d %.6f %d",
+                idx, n->max_cores, n->max_ram, n->max_power, n->multi,
+                fail_prob, repair_time);
+            outf("SERVER: подключён node %d\n", idx);
+        } else if (!strcmp(type, "task") && idx >= 0 && idx < MAX_TASKS) {
+            fd_task[idx] = fd; accepted++;
+            Task *t = &tasks[idx];
+            char buf[2048];
+            int off = snprintf(buf, sizeof buf,
+                "INIT_TASK %d %s %d %d %d %d %d %d %d %d %d %d %d",
+                idx, t->name, t->arrival_time, t->duration,
+                t->req_cores, t->req_ram, t->req_power,
+                t->priority, t->deadline, t->multi, t->preempt, t->checkpoint,
+                MAX_NODES);
+            for (int i = 0; i < MAX_NODES; i++)
+                off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
+                    center.nodes[i].max_cores, center.nodes[i].max_ram,
+                    center.nodes[i].max_power);
+            net_send_line(fd, "%s", buf);
+            outf("SERVER: подключён task %d\n", idx);
+        } else {
+            close(fd);
+        }
+    }
+
+    if (accepted < expected) {
+        outf("SERVER: %d/%d клиентов, аварийный выход\n", accepted, expected);
+        for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
+        for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
+        close(listen_fd);
+        for (int k = 0; k < nchildren; k++) waitpid(children[k], NULL, 0);
+        print_summary();
+        if (log_fd >= 0) close(log_fd);
+        free(shm); shm = NULL;
+        return stop_flag ? 0 : 1;
+    }
+
+    /* ---- Тактовый цикл ---- */
+    for (int t = 0; ; t++) {
+        if (stop_flag) break;
+        if (time_limit > 0 && t >= time_limit) { outf("SERVER: [t=%d] период завершён\n", t); break; }
+        if (t > 0 && all_done()) { outf("SERVER: [t=%d] все задания обработаны\n", t); break; }
+
+        cur_time = t;
+
+        /* Фаза 1: узлы */
+        for (int i = 0; i < MAX_NODES; i++) {
+            Node *n = &center.nodes[i];
+            net_send_line(fd_node[i], "NODE_WORK %d %d %d %d %d %d",
+                t, n->status, n->repair_left,
+                n->used_cores, n->user_ram, n->used_power);
+        }
+        for (int i = 0; i < MAX_NODES; i++) {
+            char line[256];
+            if (net_recv_line(fd_node[i], line, sizeof line) < 0) { stop_flag = 1; break; }
+            int st, rl; char ev[16];
+            if (sscanf(line, "NODE_RESULT %d %d %15s", &st, &rl, ev) != 3) continue;
+            center.nodes[i].status = st;
+            center.nodes[i].repair_left = rl;
+            outf("SERVER: [t=%d] от node %d: %s\n", t, i, ev);
+            if (!strcmp(ev, "failed")) {
+                stat_node_fails++;
+                for (int j = 0; j < MAX_TASKS; j++) {
+                    Task *tk = &tasks[j];
+                    if (tk->status != RUNNING) continue;
+                    if (!(tk->used_mask & (1u << i))) continue;
+                    alloc_give(tk);
+                    alloc_clear(tk);
+                    tk->time_remaining = tk->duration;
+                    tk->restart_count++;
+                    tk->status = WAITING;
+                    stat_restart++;
+                    outf("SERVER: [t=%d] task %s перезапущен (отказ node %d)\n",
+                         t, tk->name, i);
+                    net_send_line(fd_task[j], "TASK_RESTARTED %d %d", t, i);
+                }
+            }
+        }
+        if (stop_flag) break;
+
+        /* Фаза 2: задания */
+        for (int j = 0; j < MAX_TASKS; j++) {
+            Task *tk = &tasks[j];
+            char buf[2048];
+            int off = snprintf(buf, sizeof buf, "TASK_WORK %d %d %d %d %d %d %d",
+                t, tk->status, tk->arrival_time, tk->time_remaining,
+                tk->duration, MAX_NODES, tk->multi);
+            for (int i = 0; i < MAX_NODES; i++)
+                off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
+                    center.nodes[i].max_cores, center.nodes[i].max_ram,
+                    center.nodes[i].max_power);
+            net_send_line(fd_task[j], "%s", buf);
+        }
+        for (int j = 0; j < MAX_TASKS; j++) {
+            char line[256];
+            if (net_recv_line(fd_task[j], line, sizeof line) < 0) { stop_flag = 1; break; }
+            int st; char ev[16];
+            if (sscanf(line, "TASK_RESULT %d %15s", &st, ev) != 2) continue;
+            Task *tk = &tasks[j];
+            if (!strcmp(ev, "arrived")) {
+                outf("SERVER: [t=%d] task %s прибыл\n", t, tk->name);
+            } else if (!strcmp(ev, "rejected")) {
+                tk->status = FAILED;
+                tk->finish_time = t;
+                stat_failed++;
+                outf("SERVER: [t=%d] task %s отклонён\n", t, tk->name);
+            } else if (!strcmp(ev, "completed")) {
+                alloc_give(tk);
+                alloc_clear(tk);
+                tk->status = DONE;
+                tk->finish_time = t;
+                stat_done++;
+                if (tk->start_time >= 0)
+                    stat_wait_sum += tk->start_time - tk->arrival_time;
+                stat_turn_sum += t - tk->arrival_time;
+                outf("SERVER: [t=%d] task %s завершён\n", t, tk->name);
+            }
+        }
+        if (stop_flag) break;
+
+        /* Фаза 3: планировщик (обёртка фильтрует arrival_time) */
+        scheduler_work_with_arrival(t);
+
+        /* Фаза 4: пост-обработка */
+        for (int j = 0; j < MAX_TASKS; j++) {
+            Task *tk = &tasks[j];
+            if (tk->deadline <= 0) continue;
+            if (tk->status == DONE || tk->status == FAILED) continue;
+            if (t <= tk->deadline) continue;
+            if (tk->status == RUNNING) { alloc_give(tk); alloc_clear(tk); }
+            tk->status = FAILED;
+            tk->finish_time = t;
+            stat_failed++;
+            outf("SERVER: [t=%d] task %s просрочен (дедлайн %d)\n", t, tk->name, tk->deadline);
+        }
+        for (int j = 0; j < MAX_TASKS; j++)
+            if (tasks[j].status == RUNNING) tasks[j].time_remaining--;
+        stat_energy += total_power();
+
+        for (int i = 0; i < MAX_NODES; i++) {
+            Node *n = &center.nodes[i];
+            int cnt = 0;
+            for (int j = 0; j < MAX_TASKS; j++)
+                if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i))) cnt++;
+            char buf[1024];
+            int off = snprintf(buf, sizeof buf, "NODE_STATE %d %d %d %d %d %d %d",
+                t, n->status, n->repair_left, n->used_cores, n->user_ram, n->used_power, cnt);
+            for (int j = 0; j < MAX_TASKS; j++)
+                if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i)))
+                    off += snprintf(buf + off, sizeof buf - off, " %d", j);
+            net_send_line(fd_node[i], "%s", buf);
+        }
+        for (int j = 0; j < MAX_TASKS; j++) {
+            Task *tk = &tasks[j];
+            char buf[512];
+            int off = snprintf(buf, sizeof buf, "TASK_STATE %d %d %d %d",
+                t, tk->status, tk->time_remaining, tk->node_count);
+            for (int i = 0; i < MAX_NODES; i++)
+                if (tk->used_mask & (1u << i))
+                    off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
+                        i, tk->alloc_cores[i], tk->alloc_mem[i]);
+            net_send_line(fd_task[j], "%s", buf);
+        }
+
+        delay_ms(tick_delay_ms);
+    }
+
+    /* ---- Завершение ---- */
+    for (int i = 0; i < MAX_NODES; i++) net_send_line(fd_node[i], "SHUTDOWN");
+    for (int j = 0; j < MAX_TASKS; j++) net_send_line(fd_task[j], "SHUTDOWN");
+    for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
+    for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
+    close(listen_fd);
+    for (int k = 0; k < nchildren; k++) waitpid(children[k], NULL, 0);
+
+    print_summary();
+    if (log_fd >= 0) close(log_fd);
+    free(shm); shm = NULL;
+    return 0;
+}
+
+/* ---- client ---- */
+static int cmd_client(int argc, char **argv) {
+    const char *host = NULL, *type = NULL, *log_path = NULL;
+    int port = 0, idx = -1;
+
+    for (int i = 2; i < argc; i++) {
+        if      (!strcmp(argv[i], "--host") && i+1<argc) host     = argv[++i];
+        else if (!strcmp(argv[i], "--port") && i+1<argc) port     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--type") && i+1<argc) type     = argv[++i];
+        else if (!strcmp(argv[i], "--idx")  && i+1<argc) idx      = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-l")     && i+1<argc) log_path = argv[++i];
+        else { fprintf(stderr, "client: неизвестный ключ %s\n", argv[i]); return 1; }
+    }
+    if (!host || port <= 0 || !type || idx < 0) {
+        fprintf(stderr,
+            "Использование: %s client --host H --port P --type node|task --idx N\n"
+            "               [-l файл]\n", argv[0]);
+        return 1;
+    }
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal_client;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    char def_log[64];
+    if (!log_path) {
+        snprintf(def_log, sizeof def_log, "log_%s_%d.log", type, idx);
+        log_path = def_log;
+    }
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+
+    int fd = net_connect(host, port);
+    if (fd < 0) {
+        fprintf(stderr, "client: connect %s:%d не удался\n", host, port);
+        if (log_fd >= 0) close(log_fd);
+        return 1;
+    }
+    net_send_line(fd, "HELLO %s %d", type, idx);
+
+    char line[2048];
+    if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); if (log_fd >= 0) close(log_fd); return 1; }
+    outf("CLIENT %s %d: %s\n", type, idx, line);
+
+    int is_node = !strcmp(type, "node");
+    int is_task = !strcmp(type, "task");
+    if (!is_node && !is_task) { close(fd); if (log_fd >= 0) close(log_fd); return 1; }
+
+    int max_cores = 0, max_ram = 0, max_power = 0, multi = 0;
+    double local_fail_prob = 0.0;
+    int local_repair_time = 3;
+    int node_caps[MAX_NODES][3];
+    Task local_task = {0};
+
+    if (is_node) {
+        int i;
+        sscanf(line, "INIT_NODE %d %d %d %d %d %lf %d",
+            &i, &max_cores, &max_ram, &max_power, &multi,
+            &local_fail_prob, &local_repair_time);
+        srand(0xDEADBEEFu ^ (unsigned)idx);
+    } else {
+        int i, nn;
+        sscanf(line, "INIT_TASK %d %15s %d %d %d %d %d %d %d %d %d %d %d",
+            &i, local_task.name, &local_task.arrival_time, &local_task.duration,
+            &local_task.req_cores, &local_task.req_ram, &local_task.req_power,
+            &local_task.priority, &local_task.deadline,
+            &local_task.multi, &local_task.preempt, &local_task.checkpoint, &nn);
+        char *p = line;
+        for (int k = 0; k < 13 && p; k++) { p = strchr(p, ' '); if (p) p++; }
+        for (int k = 0; k < nn && p; k++) {
+            sscanf(p, "%d %d %d", &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
+            for (int f = 0; f < 3; f++) { p = strchr(p, ' '); if (p) p++; }
+        }
+        srand(0xCAFEBABEu ^ (unsigned)idx);
+    }
+
+    int arrival_reported = 0;
+
+    for (;;) {
+        if (net_recv_line(fd, line, sizeof line) < 0) {
+            if (client_stop) outf("CLIENT %s %d: прервано пользователем\n", type, idx);
+            else             outf("CLIENT %s %d: соединение закрыто\n", type, idx);
+            break;
+        }
+        if (!strcmp(line, "SHUTDOWN")) {
+            outf("CLIENT %s %d: SHUTDOWN\n", type, idx);
+            break;
+        }
+
+        if (is_node && !strncmp(line, "NODE_WORK ", 10)) {
+            int t, status, rl, uc, ur, up;
+            sscanf(line, "NODE_WORK %d %d %d %d %d %d",
+                   &t, &status, &rl, &uc, &ur, &up);
+            const char *ev = "none";
+            if (status == NODE_FAILED) {
+                if (--rl <= 0) { status = NODE_OK; ev = "restored";
+                    outf("CLIENT node %d: [t=%d] ВОССТАНОВЛЕН\n", idx, t); }
+            } else if (local_fail_prob > 0.0 &&
+                       (double)rand() / RAND_MAX < local_fail_prob) {
+                status = NODE_FAILED; rl = local_repair_time; ev = "failed";
+                outf("CLIENT node %d: [t=%d] ОТКАЗ (ремонт %d)\n",
+                     idx, t, local_repair_time);
+            }
+            net_send_line(fd, "NODE_RESULT %d %d %s", status, rl, ev);
+        }
+        else if (is_node && !strncmp(line, "NODE_STATE ", 11)) {
+            int t, status, rl, uc, ur, up, nt;
+            sscanf(line, "NODE_STATE %d %d %d %d %d %d %d",
+                   &t, &status, &rl, &uc, &ur, &up, &nt);
+            outf("CLIENT node %d: [t=%d] %s cores=%d/%d ram=%d/%d pwr=%d/%d tasks=%d\n",
+                 idx, t, status == NODE_OK ? "OK" : "FAILED",
+                 uc, max_cores, ur, max_ram, up, max_power, nt);
+        }
+        else if (is_task && !strncmp(line, "TASK_WORK ", 10)) {
+            int t, status, arrival, trem, dur, nn, m;
+            sscanf(line, "TASK_WORK %d %d %d %d %d %d %d",
+                   &t, &status, &arrival, &trem, &dur, &nn, &m);
+            char *p = line;
+            for (int k = 0; k < 7 && p; k++) { p = strchr(p, ' '); if (p) p++; }
+            for (int k = 0; k < nn && p; k++) {
+                sscanf(p, "%d %d %d", &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
+                for (int f = 0; f < 3; f++) { p = strchr(p, ' '); if (p) p++; }
+            }
+            const char *ev = "none";
+            /* FIX: arrival <= t + флаг вместо arrival == t —
+             * задача регистрируется даже при позднем подключении клиента */
+            if (status == WAITING && !arrival_reported && arrival <= t) {
+                arrival_reported = 1;
+                int all_c = 0, all_r = 0, all_p = 0;
+                for (int i = 0; i < nn; i++) {
+                    all_c += node_caps[i][0]; all_r += node_caps[i][1]; all_p += node_caps[i][2];
+                }
+                int fit = (local_task.req_cores <= all_c &&
+                           local_task.req_ram   <= all_r &&
+                           local_task.req_power <= all_p);
+                if (fit && !local_task.multi) {
+                    fit = 0;
+                    for (int i = 0; i < nn; i++)
+                        if (node_caps[i][0] >= local_task.req_cores &&
+                            node_caps[i][1] >= local_task.req_ram   &&
+                            node_caps[i][2] >= local_task.req_power) { fit = 1; break; }
+                }
+                if (!fit) { ev = "rejected";
+                    outf("CLIENT task %d: [t=%d] ОТКЛОНЁН %s\n", idx, t, local_task.name); }
+                else { ev = "arrived";
+                    outf("CLIENT task %d: [t=%d] ПОСТУПИЛ %s\n", idx, t, local_task.name); }
+            } else if (status == RUNNING && trem <= 0) {
+                ev = "completed";
+                outf("CLIENT task %d: [t=%d] ЗАВЕРШЁН %s\n", idx, t, local_task.name);
+            }
+            net_send_line(fd, "TASK_RESULT %d %s", status, ev);
+        }
+        else if (is_task && !strncmp(line, "TASK_RESTARTED ", 15)) {
+            int t, node_id;
+            sscanf(line, "TASK_RESTARTED %d %d", &t, &node_id);
+            outf("CLIENT task %d: [t=%d] перезапущен после отказа node %d\n",
+                 idx, t, node_id);
+        }
+        else if (is_task && !strncmp(line, "TASK_STATE ", 11)) {
+            int t, status, trem, nc;
+            sscanf(line, "TASK_STATE %d %d %d %d", &t, &status, &trem, &nc);
+            outf("CLIENT task %d: [t=%d] status=%d rem=%d nodes=%d\n",
+                 idx, t, status, trem, nc);
+        }
+    }
+
+    close(fd);
+    if (log_fd >= 0) close(log_fd);
+    return 0;
+}
+
 /* ---- stop: внешняя остановка ---- */
 static int cmd_stop(int argc, char **argv) {
     if (argc < 3) {
@@ -726,21 +1177,23 @@ static int cmd_stop(int argc, char **argv) {
     return 0;
 }
 
-/* ---- обновлённый main: диспетчер подкоманд ---- */
+/* ---- main: диспетчер подкоманд ---- */
 int main(int argc, char **argv) {
     if (argc >= 2) {
+        if (!strcmp(argv[1], "server"))  return cmd_server(argc, argv);
+        if (!strcmp(argv[1], "client"))  return cmd_client(argc, argv);
         if (!strcmp(argv[1], "cluster")) return cmd_cluster(argc, argv);
         if (!strcmp(argv[1], "worker"))  return cmd_worker(argc, argv);
         if (!strcmp(argv[1], "stop"))    return cmd_stop(argc, argv);
         if (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
             usage(argv[0]);
             fprintf(stderr,
-                "\nПодкоманды (7-8 баллов):\n"
-                "  cluster [опции]           - мастер + fork/exec независимых воркеров\n"
-                "  worker <node|task|sched> <idx>\n"
-                "                            - воркер (запускается мастером или вручную)\n"
-                "  stop <master_pid>         - послать SIGTERM мастеру\n"
-                "\nБез подкоманды - версия на 4-5/6 баллов.\n");
+                "\nПодкоманды:\n"
+                "  server --port P [опции]         — сервер (клиент-серверная модель)\n"
+                "  client --host H --port P --type node|task --idx N [-l file]\n"
+                "  cluster [опции]                 — fork/exec воркеров (7-8)\n"
+                "  worker <node|task|sched> <idx>  — воркер для cluster\n"
+                "  stop <master_pid>               — SIGTERM мастеру\n");
             return 0;
         }
     }

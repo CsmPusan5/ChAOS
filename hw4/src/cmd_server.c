@@ -12,6 +12,90 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 
+/* ------------------------------------------------------------------
+ *  Мониторы: сериализация снимка и поиск свободного слота.
+ *  Один медленный/упавший монитор не должен блокировать остальных,
+ *  поэтому на каждый monitor-сокет ставится SO_SNDTIMEO (100 мс);
+ *  при провале write слот закрывается, остальные продолжают получать
+ *  данные в этом же тике.
+ * ------------------------------------------------------------------ */
+
+/* Занять monitor-сокет: тайм-ауты, INIT_MONITOR, регистрация. */
+static int monitor_register(int *slots, int nslots, int fd, int t_delay)
+{
+    struct timeval tv = { 0, 100000 };         /* 100 мс */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    int slot = -1;
+    for (int m = 0; m < nslots; m++)
+        if (slots[m] < 0) { slot = m; break; }
+    if (slot < 0) return -1;
+
+    if (net_send_line(fd, "INIT_MONITOR %d %d %d %d %.2f %s %d %d %.4f %d",
+            MAX_NODES, MAX_TASKS,
+            center.power_limit, center.cooling_limit, center.pue,
+            strategy_name(), time_limit, t_delay,
+            fail_prob, repair_time) < 0)
+        return -1;
+
+    slots[slot] = fd;
+    return slot;
+}
+
+/* Отправить один полный блок MONITOR_STATE … END. */
+static int monitor_send_state(int fd, int t)
+{
+    if (net_send_line(fd, "MONITOR_STATE %d", t) < 0) return -1;
+
+    for (int i = 0; i < MAX_NODES; i++) {
+        Node *n = &center.nodes[i];
+        int cnt = 0;
+        for (int j = 0; j < MAX_TASKS; j++)
+            if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i))) cnt++;
+        char buf[1024];
+        int off = snprintf(buf, sizeof buf, "N %d %d %d %d %d %d %d %d %d %d",
+            i, n->status, n->repair_left,
+            n->used_cores, n->max_cores,
+            n->user_ram, n->max_ram,
+            n->used_power, n->max_power, cnt);
+        for (int j = 0; j < MAX_TASKS; j++)
+            if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i)))
+                off += snprintf(buf + off, sizeof buf - off, " %d", j);
+        if (net_send_line(fd, "%s", buf) < 0) return -1;
+    }
+
+    int tp = total_power();
+    if (net_send_line(fd, "PWR %d %d %.2f %d %d",
+        tp, center.power_limit, center.pue, tp, center.cooling_limit) < 0)
+        return -1;
+
+    for (int j = 0; j < MAX_TASKS; j++) {
+        Task *tk = &tasks[j];
+        if (tk->status == RUNNING) {
+            char buf[512];
+            int off = snprintf(buf, sizeof buf, "RUN %d %s %d %d",
+                j, tk->name, tk->time_remaining, tk->node_count);
+            for (int i = 0; i < MAX_NODES; i++)
+                if (tk->used_mask & (1u << i))
+                    off += snprintf(buf + off, sizeof buf - off, " %d", i);
+            if (net_send_line(fd, "%s", buf) < 0) return -1;
+        }
+    }
+    for (int j = 0; j < MAX_TASKS; j++) {
+        Task *tk = &tasks[j];
+        if (tk->status == WAITING || tk->status == PREEMPTED)
+            if (net_send_line(fd, "WAIT %d %s %d", j, tk->name, tk->status) < 0)
+                return -1;
+    }
+
+    if (net_send_line(fd, "STAT %d %d %d %d %d %.0f",
+            stat_done, stat_failed, stat_preempt, stat_restart,
+            stat_node_fails, stat_energy) < 0) return -1;
+    if (net_send_line(fd, "END") < 0) return -1;
+    return 0;
+}
+
 int cmd_server(int argc, char **argv) {
     int port = 0, spawn_all = 0;
     int def_time_limit = 60, def_tick_delay = 150, def_verbose = 0;
@@ -100,7 +184,11 @@ int cmd_server(int argc, char **argv) {
     int fd_node[MAX_NODES], fd_task[MAX_TASKS];
     for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
     for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
-    int fd_monitor = -1;
+
+    /* Несколько независимых мониторов; динамическое подключение/отключение */
+    enum { MAX_MONITORS = 16 };
+    int fd_monitor[MAX_MONITORS];
+    for (int m = 0; m < MAX_MONITORS; m++) fd_monitor[m] = -1;
 
     int accepted = 0;
     while (accepted < expected && !stop_flag) {
@@ -139,14 +227,14 @@ int cmd_server(int argc, char **argv) {
             net_send_line(fd, "%s", buf);
             outf("SERVER: подключён task %d\n", idx);
         } else if (!strcmp(type, "monitor")) {
-            if (fd_monitor >= 0) close(fd_monitor);
-            fd_monitor = fd;
-            net_send_line(fd, "INIT_MONITOR %d %d %d %d %.2f %s %d %d %.4f %d",
-                MAX_NODES, MAX_TASKS,
-                center.power_limit, center.cooling_limit, center.pue,
-                strategy_name(), time_limit, tick_delay_ms,
-                fail_prob, repair_time);
-            outf("SERVER: подключён monitor\n");
+            int slot = monitor_register(fd_monitor, MAX_MONITORS, fd, tick_delay_ms);
+            if (slot < 0) {
+                net_send_line(fd, "SHUTDOWN");   /* нет свободного слота */
+                close(fd);
+                outf("SERVER: monitor отклонён (нет слотов)\n");
+            } else {
+                outf("SERVER: подключён monitor #%d\n", slot);
+            }
         } else {
             close(fd);
         }
@@ -156,6 +244,8 @@ int cmd_server(int argc, char **argv) {
         outf("SERVER: %d/%d клиентов, аварийный выход\n", accepted, expected);
         for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
         for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
+        for (int m = 0; m < MAX_MONITORS; m++)
+            if (fd_monitor[m] >= 0) close(fd_monitor[m]);
         close(listen_fd);
         for (int k = 0; k < nchildren; k++) waitpid(children[k], NULL, 0);
         print_summary();
@@ -175,30 +265,38 @@ int cmd_server(int argc, char **argv) {
         if (time_limit > 0 && t >= time_limit) { outf("SERVER: [t=%d] период завершён\n", t); break; }
         if (t > 0 && all_done()) { outf("SERVER: [t=%d] все задания обработаны\n", t); break; }
 
-        /* --- Неблокирующий приём нового монитора --- */
+        /* --- Неблокирующий приём новых мониторов (динамическое подключение) --- */
         for (;;) {
             int nfd = accept(listen_fd, NULL, NULL);
             if (nfd < 0) break;
-            struct timeval tv = { 0, 100000 };  /* 100 мс на HELLO */
+
+            struct timeval tv = { 0, 100000 };   /* 100 мс на HELLO */
             setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
             char hl[256];
-            int ok = 0;
+            int handled = 0;
             if (net_recv_line(nfd, hl, sizeof hl) >= 0) {
                 char ty[16]; int ii;
                 if (sscanf(hl, "HELLO %15s %d", ty, &ii) == 2 &&
                     !strcmp(ty, "monitor")) {
-                    if (fd_monitor >= 0) close(fd_monitor);
-                    fd_monitor = nfd;
-                    net_send_line(nfd, "INIT_MONITOR %d %d %d %d %.2f %s %d %d %.4f %d",
-                        MAX_NODES, MAX_TASKS,
-                        center.power_limit, center.cooling_limit, center.pue,
-                        strategy_name(), time_limit, tick_delay_ms,
-                        fail_prob, repair_time);
-                    outf("SERVER: подключён monitor (live)\n");
-                    ok = 1;
+                    int slot = monitor_register(fd_monitor, MAX_MONITORS,
+                                                nfd, tick_delay_ms);
+                    if (slot < 0) {
+                        net_send_line(nfd, "SHUTDOWN");
+                        close(nfd);
+                        outf("SERVER: [t=%d] monitor отклонён (нет слотов)\n", t);
+                    } else {
+                        outf("SERVER: [t=%d] подключён monitor #%d (live)\n", t, slot);
+                        handled = 1;
+                    }
                     }
             }
-            if (!ok) close(nfd);
+            if (!handled && nfd >= 0 && fd_monitor[0] >= -1) {
+                int is_registered = 0;
+                for (int m = 0; m < MAX_MONITORS; m++)
+                    if (fd_monitor[m] == nfd) { is_registered = 1; break; }
+                if (!is_registered) close(nfd);
+            }
         }
 
         cur_time = t;
@@ -322,64 +420,28 @@ int cmd_server(int argc, char **argv) {
             net_send_line(fd_task[j], "%s", buf);
         }
 
-        /* --- Комплексный снимок для монитора --- */
-        if (fd_monitor >= 0) {
-            net_send_line(fd_monitor, "MONITOR_STATE %d", t);
-
-            for (int i = 0; i < MAX_NODES; i++) {
-                Node *n = &center.nodes[i];
-                int cnt = 0;
-                for (int j = 0; j < MAX_TASKS; j++)
-                    if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i))) cnt++;
-                char buf[1024];
-                int off = snprintf(buf, sizeof buf,
-                    "N %d %d %d %d %d %d %d %d %d %d",
-                    i, n->status, n->repair_left,
-                    n->used_cores, n->max_cores,
-                    n->user_ram, n->max_ram,
-                    n->used_power, n->max_power, cnt);
-                for (int j = 0; j < MAX_TASKS; j++)
-                    if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i)))
-                        off += snprintf(buf + off, sizeof buf - off, " %d", j);
-                net_send_line(fd_monitor, "%s", buf);
+        /* --- Комплексный снимок: рассылка всем активным мониторам --- */
+        for (int m = 0; m < MAX_MONITORS; m++) {
+            if (fd_monitor[m] < 0) continue;
+            if (monitor_send_state(fd_monitor[m], t) < 0) {
+                outf("SERVER: [t=%d] monitor #%d отключён (send failed)\n", t, m);
+                close(fd_monitor[m]);
+                fd_monitor[m] = -1;
             }
-
-            int tp = total_power();
-            net_send_line(fd_monitor, "PWR %d %d %.2f %d %d",
-                tp, center.power_limit, center.pue, tp, center.cooling_limit);
-
-            for (int j = 0; j < MAX_TASKS; j++) {
-                Task *tk = &tasks[j];
-                if (tk->status == RUNNING) {
-                    char buf[512];
-                    int off = snprintf(buf, sizeof buf, "RUN %d %s %d %d",
-                        j, tk->name, tk->time_remaining, tk->node_count);
-                    for (int i = 0; i < MAX_NODES; i++)
-                        if (tk->used_mask & (1u << i))
-                            off += snprintf(buf + off, sizeof buf - off, " %d", i);
-                    net_send_line(fd_monitor, "%s", buf);
-                }
-            }
-            for (int j = 0; j < MAX_TASKS; j++) {
-                Task *tk = &tasks[j];
-                if (tk->status == WAITING || tk->status == PREEMPTED)
-                    net_send_line(fd_monitor, "WAIT %d %s %d",
-                        j, tk->name, tk->status);
-            }
-            net_send_line(fd_monitor, "STAT %d %d %d %d %d %.0f",
-                stat_done, stat_failed, stat_preempt, stat_restart,
-                stat_node_fails, stat_energy);
-            net_send_line(fd_monitor, "END");
         }
 
         delay_ms(tick_delay_ms);
     }
+
     /* ---- Завершение ---- */
     for (int i = 0; i < MAX_NODES; i++) net_send_line(fd_node[i], "SHUTDOWN");
     for (int j = 0; j < MAX_TASKS; j++) net_send_line(fd_task[j], "SHUTDOWN");
-    if (fd_monitor >= 0) {
-        net_send_line(fd_monitor, "SHUTDOWN");
-        close(fd_monitor);
+    for (int m = 0; m < MAX_MONITORS; m++) {
+        if (fd_monitor[m] >= 0) {
+            net_send_line(fd_monitor[m], "SHUTDOWN");
+            close(fd_monitor[m]);
+            fd_monitor[m] = -1;
+        }
     }
     for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
     for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);

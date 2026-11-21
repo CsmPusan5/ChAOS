@@ -1,4 +1,8 @@
-/*  Сервер клиент-серверной модели: такты, обмен, монитор. */
+/*  Сервер клиент-серверной модели.
+ *  - Динамическое подключение/отключение клиентов (node/task/monitor).
+ *  - Отсутствующий клиент: узел/задача «замирают» (не декремент, не меняют состояние).
+ *  - Переподключение: новый HELLO с тем же idx заменяет старый сокет.
+ *  - При завершении — SHUTDOWN всем активным клиентам. */
 #include "sim.h"
 #include "net.h"
 #include <stdio.h>
@@ -12,18 +16,12 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 
-/* ------------------------------------------------------------------
- *  Мониторы: сериализация снимка и поиск свободного слота.
- *  Один медленный/упавший монитор не должен блокировать остальных,
- *  поэтому на каждый monitor-сокет ставится SO_SNDTIMEO (100 мс);
- *  при провале write слот закрывается, остальные продолжают получать
- *  данные в этом же тике.
- * ------------------------------------------------------------------ */
+#define MAX_MONITORS 16
+#define GRACE_MS     5000    /* макс. время ожидания стартовых клиентов */
 
-/* Занять monitor-сокет: тайм-ауты, INIT_MONITOR, регистрация. */
-static int monitor_register(int *slots, int nslots, int fd, int t_delay)
-{
-    struct timeval tv = { 0, 100000 };         /* 100 мс */
+/* ---------- Мониторы ---------- */
+static int monitor_register(int *slots, int nslots, int fd, int t_delay) {
+    struct timeval tv = { 0, 100000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
@@ -43,9 +41,7 @@ static int monitor_register(int *slots, int nslots, int fd, int t_delay)
     return slot;
 }
 
-/* Отправить один полный блок MONITOR_STATE … END. */
-static int monitor_send_state(int fd, int t)
-{
+static int monitor_send_state(int fd, int t) {
     if (net_send_line(fd, "MONITOR_STATE %d", t) < 0) return -1;
 
     for (int i = 0; i < MAX_NODES; i++) {
@@ -67,8 +63,7 @@ static int monitor_send_state(int fd, int t)
 
     int tp = total_power();
     if (net_send_line(fd, "PWR %d %d %.2f %d %d",
-        tp, center.power_limit, center.pue, tp, center.cooling_limit) < 0)
-        return -1;
+        tp, center.power_limit, center.pue, tp, center.cooling_limit) < 0) return -1;
 
     for (int j = 0; j < MAX_TASKS; j++) {
         Task *tk = &tasks[j];
@@ -88,7 +83,6 @@ static int monitor_send_state(int fd, int t)
             if (net_send_line(fd, "WAIT %d %s %d", j, tk->name, tk->status) < 0)
                 return -1;
     }
-
     if (net_send_line(fd, "STAT %d %d %d %d %d %.0f",
             stat_done, stat_failed, stat_preempt, stat_restart,
             stat_node_fails, stat_energy) < 0) return -1;
@@ -96,6 +90,112 @@ static int monitor_send_state(int fd, int t)
     return 0;
 }
 
+/* ---------- INIT/STATE для переподключающегося клиента ---------- */
+static void send_node_init(int fd, int idx, int t) {
+    Node *n = &center.nodes[idx];
+    net_send_line(fd, "INIT_NODE %d %d %d %d %d %.6f %d",
+        idx, n->max_cores, n->max_ram, n->max_power, n->multi,
+        fail_prob, repair_time);
+    int cnt = 0;
+    for (int j = 0; j < MAX_TASKS; j++)
+        if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << idx))) cnt++;
+    char buf[1024];
+    int off = snprintf(buf, sizeof buf, "NODE_STATE %d %d %d %d %d %d %d",
+        t, n->status, n->repair_left,
+        n->used_cores, n->user_ram, n->used_power, cnt);
+    for (int j = 0; j < MAX_TASKS; j++)
+        if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << idx)))
+            off += snprintf(buf + off, sizeof buf - off, " %d", j);
+    net_send_line(fd, "%s", buf);
+}
+
+static void send_task_init(int fd, int idx, int t) {
+    Task *tk = &tasks[idx];
+    char buf[2048];
+    int off = snprintf(buf, sizeof buf,
+        "INIT_TASK %d %s %d %d %d %d %d %d %d %d %d %d %d",
+        idx, tk->name, tk->arrival_time, tk->duration,
+        tk->req_cores, tk->req_ram, tk->req_power,
+        tk->priority, tk->deadline, tk->multi, tk->preempt, tk->checkpoint,
+        MAX_NODES);
+    for (int i = 0; i < MAX_NODES; i++)
+        off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
+            center.nodes[i].max_cores, center.nodes[i].max_ram,
+            center.nodes[i].max_power);
+    net_send_line(fd, "%s", buf);
+
+    char s[512];
+    off = snprintf(s, sizeof s, "TASK_STATE %d %d %d %d",
+        t, tk->status, tk->time_remaining, tk->node_count);
+    for (int i = 0; i < MAX_NODES; i++)
+        if (tk->used_mask & (1u << i))
+            off += snprintf(s + off, sizeof s - off, " %d %d %d",
+                i, tk->alloc_cores[i], tk->alloc_mem[i]);
+    net_send_line(fd, "%s", s);
+}
+
+/* ---------- Приём нового соединения ---------- */
+static int handle_connection(int fd, int t,
+                             int *fd_node, int *fd_task,
+                             int *fd_mon, int nmon, int tdelay) {
+    struct timeval tv = { 0, 200000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
+    char line[256];
+    if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); return -1; }
+
+    char type[16]; int idx;
+    if (sscanf(line, "HELLO %15s %d", type, &idx) != 2) { close(fd); return -1; }
+
+    if (!strcmp(type, "node") && idx >= 0 && idx < MAX_NODES) {
+        if (fd_node[idx] >= 0) close(fd_node[idx]);
+        fd_node[idx] = fd;
+        center.nodes[idx].status      = NODE_OK;
+        center.nodes[idx].repair_left = 0;
+        send_node_init(fd, idx, t);
+        outf("SERVER: [t=%d] подключён node %d\n", t, idx);
+        return 0;
+    }
+    if (!strcmp(type, "task") && idx >= 0 && idx < MAX_TASKS) {
+        if (fd_task[idx] >= 0) close(fd_task[idx]);
+        fd_task[idx] = fd;
+        send_task_init(fd, idx, t);
+        outf("SERVER: [t=%d] подключён task %d\n", t, idx);
+        return 0;
+    }
+    if (!strcmp(type, "monitor")) {
+        int slot = monitor_register(fd_mon, nmon, fd, tdelay);
+        if (slot < 0) {
+            net_send_line(fd, "SHUTDOWN");
+            close(fd);
+            outf("SERVER: [t=%d] monitor отклонён (нет слотов)\n", t);
+            return -1;
+        }
+        outf("SERVER: [t=%d] подключён monitor #%d\n", t, slot);
+        return 0;
+    }
+    close(fd);
+    return -1;
+}
+
+/* ---------- При отключении узла ---------- */
+static void restart_tasks_on_node(int node_id, int t) {
+    for (int j = 0; j < MAX_TASKS; j++) {
+        Task *tk = &tasks[j];
+        if (tk->status != RUNNING) continue;
+        if (!(tk->used_mask & (1u << node_id))) continue;
+        alloc_give(tk);
+        alloc_clear(tk);
+        tk->time_remaining = tk->duration;
+        tk->restart_count++;
+        tk->status = WAITING;
+        stat_restart++;
+        outf("SERVER: [t=%d] task %s возвращён в очередь (node %d отключён)\n",
+             t, tk->name, node_id);
+    }
+}
+
+/* ---------- Сервер ---------- */
 int cmd_server(int argc, char **argv) {
     int port = 0, spawn_all = 0;
     int def_time_limit = 60, def_tick_delay = 150, def_verbose = 0;
@@ -141,21 +241,26 @@ int cmd_server(int argc, char **argv) {
     srand(def_seed);
     init_simulation();
 
-    outf("SERVER: порт %d, стратегия %s, seed %u, время %d\n",
-         port, strategy_name(), def_seed, time_limit);
+    outf("SERVER: порт %d, стратегия %s, seed %u, период %d, задержка %d мс\n",
+         port, strategy_name(), def_seed, time_limit, tick_delay_ms);
+    outf("SERVER: динамическое отключение/подключение клиентов\n");
 
     int listen_fd = net_listen(port, 64);
     if (listen_fd < 0) { perror("listen"); free(shm); shm = NULL; return 1; }
     fcntl(listen_fd, F_SETFD, FD_CLOEXEC);
 
-    int expected = MAX_NODES + MAX_TASKS;
+    int fd_node[MAX_NODES], fd_task[MAX_TASKS], fd_monitor[MAX_MONITORS];
+    for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
+    for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
+    for (int m = 0; m < MAX_MONITORS; m++) fd_monitor[m] = -1;
+
     pid_t children[MAX_NODES + MAX_TASKS];
     int nchildren = 0;
 
     if (spawn_all) {
         for (int i = 0; i < MAX_NODES; i++) {
             pid_t p = fork();
-            if (p < 0) { perror("fork node"); expected--; continue; }
+            if (p < 0) { perror("fork node"); continue; }
             if (p == 0) {
                 char ps[16], is[16];
                 snprintf(ps, sizeof ps, "%d", port);
@@ -168,7 +273,7 @@ int cmd_server(int argc, char **argv) {
         }
         for (int i = 0; i < MAX_TASKS; i++) {
             pid_t p = fork();
-            if (p < 0) { perror("fork task"); expected--; continue; }
+            if (p < 0) { perror("fork task"); continue; }
             if (p == 0) {
                 char ps[16], is[16];
                 snprintf(ps, sizeof ps, "%d", port);
@@ -181,136 +286,71 @@ int cmd_server(int argc, char **argv) {
         }
     }
 
-    int fd_node[MAX_NODES], fd_task[MAX_TASKS];
-    for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
-    for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
-
-    /* Несколько независимых мониторов; динамическое подключение/отключение */
-    enum { MAX_MONITORS = 16 };
-    int fd_monitor[MAX_MONITORS];
-    for (int m = 0; m < MAX_MONITORS; m++) fd_monitor[m] = -1;
-
-    int accepted = 0;
-    while (accepted < expected && !stop_flag) {
-        int fd = net_accept(listen_fd);
-        if (fd < 0) {
-            if (errno == EINTR) continue;
-            perror("accept"); break;
-        }
-
-        char line[256];
-        if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); continue; }
-        char type[16]; int idx;
-        if (sscanf(line, "HELLO %15s %d", type, &idx) != 2) { close(fd); continue; }
-
-        if (!strcmp(type, "node") && idx >= 0 && idx < MAX_NODES) {
-            fd_node[idx] = fd; accepted++;
-            Node *n = &center.nodes[idx];
-            net_send_line(fd, "INIT_NODE %d %d %d %d %d %.6f %d",
-                idx, n->max_cores, n->max_ram, n->max_power, n->multi,
-                fail_prob, repair_time);
-            outf("SERVER: подключён node %d\n", idx);
-        } else if (!strcmp(type, "task") && idx >= 0 && idx < MAX_TASKS) {
-            fd_task[idx] = fd; accepted++;
-            Task *t = &tasks[idx];
-            char buf[2048];
-            int off = snprintf(buf, sizeof buf,
-                "INIT_TASK %d %s %d %d %d %d %d %d %d %d %d %d %d",
-                idx, t->name, t->arrival_time, t->duration,
-                t->req_cores, t->req_ram, t->req_power,
-                t->priority, t->deadline, t->multi, t->preempt, t->checkpoint,
-                MAX_NODES);
-            for (int i = 0; i < MAX_NODES; i++)
-                off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
-                    center.nodes[i].max_cores, center.nodes[i].max_ram,
-                    center.nodes[i].max_power);
-            net_send_line(fd, "%s", buf);
-            outf("SERVER: подключён task %d\n", idx);
-        } else if (!strcmp(type, "monitor")) {
-            int slot = monitor_register(fd_monitor, MAX_MONITORS, fd, tick_delay_ms);
-            if (slot < 0) {
-                net_send_line(fd, "SHUTDOWN");   /* нет свободного слота */
-                close(fd);
-                outf("SERVER: monitor отклонён (нет слотов)\n");
-            } else {
-                outf("SERVER: подключён monitor #%d\n", slot);
-            }
-        } else {
-            close(fd);
-        }
-    }
-
-    if (accepted < expected) {
-        outf("SERVER: %d/%d клиентов, аварийный выход\n", accepted, expected);
-        for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
-        for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
-        for (int m = 0; m < MAX_MONITORS; m++)
-            if (fd_monitor[m] >= 0) close(fd_monitor[m]);
-        close(listen_fd);
-        for (int k = 0; k < nchildren; k++) waitpid(children[k], NULL, 0);
-        print_summary();
-        if (log_fd >= 0) close(log_fd);
-        free(shm); shm = NULL;
-        return stop_flag ? 0 : 1;
-    }
-
-    /* ---- Тактовый цикл ---- */
-    /* После старта сервер принимает новые подключения монитора на лету. */
     int lf = fcntl(listen_fd, F_GETFL);
     fcntl(listen_fd, F_SETFL, lf | O_NONBLOCK);
 
-    /* ---- Тактовый цикл ---- */
+    /* ---- Grace period ---- */
+    outf("SERVER: grace period до %d мс\n", GRACE_MS);
+    for (int waited = 0; waited < GRACE_MS && !stop_flag; waited += 100) {
+        int nfd;
+        while ((nfd = accept(listen_fd, NULL, NULL)) >= 0)
+            handle_connection(nfd, 0, fd_node, fd_task, fd_monitor,
+                              MAX_MONITORS, tick_delay_ms);
+        int all_attached = 1;
+        for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] < 0) { all_attached = 0; break; }
+        for (int j = 0; all_attached && j < MAX_TASKS; j++) if (fd_task[j] < 0) { all_attached = 0; break; }
+        if (all_attached) break;
+        delay_ms(100);
+    }
+    outf("SERVER: grace period завершён\n");
+
+    /* ---- Тиковый цикл ---- */
     for (int t = 0; ; t++) {
         if (stop_flag) break;
-        if (time_limit > 0 && t >= time_limit) { outf("SERVER: [t=%d] период завершён\n", t); break; }
-        if (t > 0 && all_done()) { outf("SERVER: [t=%d] все задания обработаны\n", t); break; }
+        if (time_limit > 0 && t >= time_limit) {
+            outf("SERVER: [t=%d] период завершён\n", t);
+            break;
+        }
+        if (t > 0 && all_done()) {
+            outf("SERVER: [t=%d] все задания обработаны\n", t);
+            break;
+        }
 
-        /* --- Неблокирующий приём новых мониторов (динамическое подключение) --- */
+        /* --- Живой accept --- */
         for (;;) {
             int nfd = accept(listen_fd, NULL, NULL);
             if (nfd < 0) break;
-
-            struct timeval tv = { 0, 100000 };   /* 100 мс на HELLO */
-            setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-
-            char hl[256];
-            int handled = 0;
-            if (net_recv_line(nfd, hl, sizeof hl) >= 0) {
-                char ty[16]; int ii;
-                if (sscanf(hl, "HELLO %15s %d", ty, &ii) == 2 &&
-                    !strcmp(ty, "monitor")) {
-                    int slot = monitor_register(fd_monitor, MAX_MONITORS,
-                                                nfd, tick_delay_ms);
-                    if (slot < 0) {
-                        net_send_line(nfd, "SHUTDOWN");
-                        close(nfd);
-                        outf("SERVER: [t=%d] monitor отклонён (нет слотов)\n", t);
-                    } else {
-                        outf("SERVER: [t=%d] подключён monitor #%d (live)\n", t, slot);
-                        handled = 1;
-                    }
-                    }
-            }
-            if (!handled && nfd >= 0 && fd_monitor[0] >= -1) {
-                int is_registered = 0;
-                for (int m = 0; m < MAX_MONITORS; m++)
-                    if (fd_monitor[m] == nfd) { is_registered = 1; break; }
-                if (!is_registered) close(nfd);
-            }
+            handle_connection(nfd, t, fd_node, fd_task, fd_monitor,
+                              MAX_MONITORS, tick_delay_ms);
         }
 
         cur_time = t;
 
-        /* Фаза 1: узлы */
+        /* Фаза 1: узлы (только подключённые) */
         for (int i = 0; i < MAX_NODES; i++) {
+            if (fd_node[i] < 0) continue;
             Node *n = &center.nodes[i];
-            net_send_line(fd_node[i], "NODE_WORK %d %d %d %d %d %d",
-                t, n->status, n->repair_left,
-                n->used_cores, n->user_ram, n->used_power);
+            if (net_send_line(fd_node[i], "NODE_WORK %d %d %d %d %d %d",
+                    t, n->status, n->repair_left,
+                    n->used_cores, n->user_ram, n->used_power) < 0) {
+                outf("SERVER: [t=%d] node %d отвалился при send\n", t, i);
+                close(fd_node[i]); fd_node[i] = -1;
+                center.nodes[i].status      = NODE_FAILED;
+                center.nodes[i].repair_left = 0;
+                restart_tasks_on_node(i, t);
+            }
         }
         for (int i = 0; i < MAX_NODES; i++) {
+            if (fd_node[i] < 0) continue;
             char line[256];
-            if (net_recv_line(fd_node[i], line, sizeof line) < 0) { stop_flag = 1; break; }
+            if (net_recv_line(fd_node[i], line, sizeof line) < 0) {
+                outf("SERVER: [t=%d] node %d отвалился при recv\n", t, i);
+                close(fd_node[i]); fd_node[i] = -1;
+                center.nodes[i].status      = NODE_FAILED;
+                center.nodes[i].repair_left = 0;
+                restart_tasks_on_node(i, t);
+                continue;
+            }
             int st, rl; char ev[16];
             if (sscanf(line, "NODE_RESULT %d %d %15s", &st, &rl, ev) != 3) continue;
             center.nodes[i].status = st;
@@ -322,22 +362,23 @@ int cmd_server(int argc, char **argv) {
                     Task *tk = &tasks[j];
                     if (tk->status != RUNNING) continue;
                     if (!(tk->used_mask & (1u << i))) continue;
-                    alloc_give(tk);
-                    alloc_clear(tk);
+                    alloc_give(tk); alloc_clear(tk);
                     tk->time_remaining = tk->duration;
                     tk->restart_count++;
                     tk->status = WAITING;
                     stat_restart++;
                     outf("SERVER: [t=%d] task %s перезапущен (отказ node %d)\n",
                          t, tk->name, i);
-                    net_send_line(fd_task[j], "TASK_RESTARTED %d %d", t, i);
+                    if (fd_task[j] >= 0)
+                        net_send_line(fd_task[j], "TASK_RESTARTED %d %d", t, i);
                 }
             }
         }
         if (stop_flag) break;
 
-        /* Фаза 2: задания */
+        /* Фаза 2: задания (только подключённые) */
         for (int j = 0; j < MAX_TASKS; j++) {
+            if (fd_task[j] < 0) continue;
             Task *tk = &tasks[j];
             char buf[2048];
             int off = snprintf(buf, sizeof buf, "TASK_WORK %d %d %d %d %d %d %d",
@@ -347,11 +388,19 @@ int cmd_server(int argc, char **argv) {
                 off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
                     center.nodes[i].max_cores, center.nodes[i].max_ram,
                     center.nodes[i].max_power);
-            net_send_line(fd_task[j], "%s", buf);
+            if (net_send_line(fd_task[j], "%s", buf) < 0) {
+                outf("SERVER: [t=%d] task %d отвалился при send\n", t, j);
+                close(fd_task[j]); fd_task[j] = -1;
+            }
         }
         for (int j = 0; j < MAX_TASKS; j++) {
+            if (fd_task[j] < 0) continue;
             char line[256];
-            if (net_recv_line(fd_task[j], line, sizeof line) < 0) { stop_flag = 1; break; }
+            if (net_recv_line(fd_task[j], line, sizeof line) < 0) {
+                outf("SERVER: [t=%d] task %d отвалился при recv\n", t, j);
+                close(fd_task[j]); fd_task[j] = -1;
+                continue;
+            }
             int st; char ev[16];
             if (sscanf(line, "TASK_RESULT %d %15s", &st, ev) != 2) continue;
             Task *tk = &tasks[j];
@@ -363,8 +412,7 @@ int cmd_server(int argc, char **argv) {
                 stat_failed++;
                 outf("SERVER: [t=%d] task %s отклонён\n", t, tk->name);
             } else if (!strcmp(ev, "completed")) {
-                alloc_give(tk);
-                alloc_clear(tk);
+                alloc_give(tk); alloc_clear(tk);
                 tk->status = DONE;
                 tk->finish_time = t;
                 stat_done++;
@@ -376,10 +424,10 @@ int cmd_server(int argc, char **argv) {
         }
         if (stop_flag) break;
 
-        /* Фаза 3: планировщик (обёртка фильтрует arrival_time) */
+        /* Фаза 3: планировщик */
         scheduler_work_with_arrival(t);
 
-        /* Фаза 4: пост-обработка */
+        /* Фаза 4: дедлайны, декремент, энергия */
         for (int j = 0; j < MAX_TASKS; j++) {
             Task *tk = &tasks[j];
             if (tk->deadline <= 0) continue;
@@ -389,26 +437,40 @@ int cmd_server(int argc, char **argv) {
             tk->status = FAILED;
             tk->finish_time = t;
             stat_failed++;
-            outf("SERVER: [t=%d] task %s просрочен (дедлайн %d)\n", t, tk->name, tk->deadline);
+            outf("SERVER: [t=%d] task %s просрочен (дедлайн %d)\n",
+                 t, tk->name, tk->deadline);
         }
-        for (int j = 0; j < MAX_TASKS; j++)
-            if (tasks[j].status == RUNNING) tasks[j].time_remaining--;
+        /* Декремент — только для RUNNING с активным клиентом */
+        for (int j = 0; j < MAX_TASKS; j++) {
+            if (tasks[j].status == RUNNING && fd_task[j] >= 0)
+                tasks[j].time_remaining--;
+        }
         stat_energy += total_power();
 
+        /* NODE_STATE клиентам */
         for (int i = 0; i < MAX_NODES; i++) {
+            if (fd_node[i] < 0) continue;
             Node *n = &center.nodes[i];
             int cnt = 0;
             for (int j = 0; j < MAX_TASKS; j++)
                 if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i))) cnt++;
             char buf[1024];
             int off = snprintf(buf, sizeof buf, "NODE_STATE %d %d %d %d %d %d %d",
-                t, n->status, n->repair_left, n->used_cores, n->user_ram, n->used_power, cnt);
+                t, n->status, n->repair_left,
+                n->used_cores, n->user_ram, n->used_power, cnt);
             for (int j = 0; j < MAX_TASKS; j++)
                 if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i)))
                     off += snprintf(buf + off, sizeof buf - off, " %d", j);
-            net_send_line(fd_node[i], "%s", buf);
+            if (net_send_line(fd_node[i], "%s", buf) < 0) {
+                close(fd_node[i]); fd_node[i] = -1;
+                center.nodes[i].status      = NODE_FAILED;
+                center.nodes[i].repair_left = 0;
+                restart_tasks_on_node(i, t);
+            }
         }
-                for (int j = 0; j < MAX_TASKS; j++) {
+        /* TASK_STATE клиентам */
+        for (int j = 0; j < MAX_TASKS; j++) {
+            if (fd_task[j] < 0) continue;
             Task *tk = &tasks[j];
             char buf[512];
             int off = snprintf(buf, sizeof buf, "TASK_STATE %d %d %d %d",
@@ -417,35 +479,33 @@ int cmd_server(int argc, char **argv) {
                 if (tk->used_mask & (1u << i))
                     off += snprintf(buf + off, sizeof buf - off, " %d %d %d",
                         i, tk->alloc_cores[i], tk->alloc_mem[i]);
-            net_send_line(fd_task[j], "%s", buf);
+            if (net_send_line(fd_task[j], "%s", buf) < 0) {
+                close(fd_task[j]); fd_task[j] = -1;
+            }
         }
 
-        /* --- Комплексный снимок: рассылка всем активным мониторам --- */
+        /* MONITOR_STATE */
         for (int m = 0; m < MAX_MONITORS; m++) {
             if (fd_monitor[m] < 0) continue;
             if (monitor_send_state(fd_monitor[m], t) < 0) {
-                outf("SERVER: [t=%d] monitor #%d отключён (send failed)\n", t, m);
-                close(fd_monitor[m]);
-                fd_monitor[m] = -1;
+                outf("SERVER: [t=%d] monitor #%d отключён\n", t, m);
+                close(fd_monitor[m]); fd_monitor[m] = -1;
             }
         }
 
         delay_ms(tick_delay_ms);
     }
 
-    /* ---- Завершение ---- */
-    for (int i = 0; i < MAX_NODES; i++) net_send_line(fd_node[i], "SHUTDOWN");
-    for (int j = 0; j < MAX_TASKS; j++) net_send_line(fd_task[j], "SHUTDOWN");
-    for (int m = 0; m < MAX_MONITORS; m++) {
-        if (fd_monitor[m] >= 0) {
-            net_send_line(fd_monitor[m], "SHUTDOWN");
-            close(fd_monitor[m]);
-            fd_monitor[m] = -1;
-        }
-    }
-    for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
-    for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
+    /* ---- Завершение: SHUTDOWN всем активным ---- */
+    outf("SERVER: завершение — SHUTDOWN всем активным клиентам\n");
+    for (int i = 0; i < MAX_NODES; i++)
+        if (fd_node[i] >= 0) { net_send_line(fd_node[i], "SHUTDOWN"); close(fd_node[i]); }
+    for (int j = 0; j < MAX_TASKS; j++)
+        if (fd_task[j] >= 0) { net_send_line(fd_task[j], "SHUTDOWN"); close(fd_task[j]); }
+    for (int m = 0; m < MAX_MONITORS; m++)
+        if (fd_monitor[m] >= 0) { net_send_line(fd_monitor[m], "SHUTDOWN"); close(fd_monitor[m]); }
     close(listen_fd);
+
     for (int k = 0; k < nchildren; k++) waitpid(children[k], NULL, 0);
 
     print_summary();

@@ -1,4 +1,5 @@
-/*  Клиент (node/task) и комплексный клиент (monitor). */
+/*  Клиент (node/task): устойчив к обрыву, переподключается.
+ *  При SHUTDOWN — выход с 0. При обрыве — retry. */
 #include "sim.h"
 #include "net.h"
 #include <stdio.h>
@@ -7,9 +8,28 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <time.h>
 
 volatile sig_atomic_t client_stop = 0;
 void on_signal_client(int s) { (void)s; client_stop = 1; }
+
+#define RECONNECT_MAX     10
+#define RECONNECT_DELAY_S 1
+
+static int connect_with_retry(const char *host, int port) {
+    for (int attempt = 1; attempt <= RECONNECT_MAX && !client_stop; attempt++) {
+        int fd = net_connect(host, port);
+        if (fd >= 0) {
+            if (attempt > 1)
+                fprintf(stderr, "client: подключились (%d/%d)\n", attempt, RECONNECT_MAX);
+            return fd;
+        }
+        fprintf(stderr, "client: connect %s:%d (%d/%d)...\n",
+                host, port, attempt, RECONNECT_MAX);
+        sleep(RECONNECT_DELAY_S);
+    }
+    return -1;
+}
 
 int cmd_client(int argc, char **argv) {
     const char *host = NULL, *type = NULL, *log_path = NULL;
@@ -44,61 +64,90 @@ int cmd_client(int argc, char **argv) {
     }
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
 
-    int fd = net_connect(host, port);
+    int fd = connect_with_retry(host, port);
     if (fd < 0) {
-        fprintf(stderr, "client: connect %s:%d не удался\n", host, port);
+        fprintf(stderr, "client: не удалось подключиться\n");
         if (log_fd >= 0) close(log_fd);
         return 1;
     }
     net_send_line(fd, "HELLO %s %d", type, idx);
 
-    char line[2048];
-    if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); if (log_fd >= 0) close(log_fd); return 1; }
-    outf("CLIENT %s %d: %s\n", type, idx, line);
-
     int is_node = !strcmp(type, "node");
     int is_task = !strcmp(type, "task");
     if (!is_node && !is_task) { close(fd); if (log_fd >= 0) close(log_fd); return 1; }
 
-    int max_cores = 0, max_ram = 0, max_power = 0, multi = 0;
+    int max_cores = 0, max_ram = 0, max_power = 0, multi_dummy = 0;
     double local_fail_prob = 0.0;
     int local_repair_time = 3;
     int node_caps[MAX_NODES][3];
     Task local_task = {0};
 
-    if (is_node) {
-        int i;
-        sscanf(line, "INIT_NODE %d %d %d %d %d %lf %d",
-            &i, &max_cores, &max_ram, &max_power, &multi,
-            &local_fail_prob, &local_repair_time);
-        srand(0xDEADBEEFu ^ (unsigned)idx);
-    } else {
-        int i, nn;
-        sscanf(line, "INIT_TASK %d %15s %d %d %d %d %d %d %d %d %d %d %d",
-            &i, local_task.name, &local_task.arrival_time, &local_task.duration,
-            &local_task.req_cores, &local_task.req_ram, &local_task.req_power,
-            &local_task.priority, &local_task.deadline,
-            &local_task.multi, &local_task.preempt, &local_task.checkpoint, &nn);
-        char *p = line;
-        for (int k = 0; k < 13 && p; k++) { p = strchr(p, ' '); if (p) p++; }
-        for (int k = 0; k < nn && p; k++) {
-            sscanf(p, "%d %d %d", &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
-            for (int f = 0; f < 3; f++) { p = strchr(p, ' '); if (p) p++; }
-        }
-        srand(0xCAFEBABEu ^ (unsigned)idx);
-    }
-
     int arrival_reported = 0;
+    int was_shutdown = 0;
+    int reconnect_attempts = 0;
+    int init_pending = 1;
+    char line[2048];
 
     for (;;) {
+        if (client_stop) { outf("CLIENT %s %d: прервано\n", type, idx); break; }
+
         if (net_recv_line(fd, line, sizeof line) < 0) {
-            if (client_stop) outf("CLIENT %s %d: прервано пользователем\n", type, idx);
-            else             outf("CLIENT %s %d: соединение закрыто\n", type, idx);
-            break;
+            if (was_shutdown) break;
+            outf("CLIENT %s %d: обрыв, переподключение...\n", type, idx);
+            close(fd); fd = -1;
+
+            if (++reconnect_attempts > RECONNECT_MAX) {
+                outf("CLIENT %s %d: не удалось переподключиться\n", type, idx);
+                break;
+            }
+            fd = connect_with_retry(host, port);
+            if (fd < 0) { outf("CLIENT %s %d: сдаюсь\n", type, idx); break; }
+
+            net_send_line(fd, "HELLO %s %d", type, idx);
+            init_pending = 1;
+            arrival_reported = 0;
+            continue;
         }
+
         if (!strcmp(line, "SHUTDOWN")) {
+            was_shutdown = 1;
             outf("CLIENT %s %d: SHUTDOWN\n", type, idx);
             break;
+        }
+
+        /* INIT после подключения/переподключения */
+        if (init_pending) {
+            if (is_node && !strncmp(line, "INIT_NODE", 9)) {
+                int i;
+                sscanf(line, "INIT_NODE %d %d %d %d %d %lf %d",
+                    &i, &max_cores, &max_ram, &max_power, &multi_dummy,
+                    &local_fail_prob, &local_repair_time);
+                outf("CLIENT node %d: %s\n", idx, line);
+                srand(0xDEADBEEFu ^ (unsigned)idx);
+                init_pending = 0;
+                continue;
+            }
+            if (is_task && !strncmp(line, "INIT_TASK", 9)) {
+                int i, nn;
+                sscanf(line, "INIT_TASK %d %15s %d %d %d %d %d %d %d %d %d %d %d",
+                    &i, local_task.name, &local_task.arrival_time, &local_task.duration,
+                    &local_task.req_cores, &local_task.req_ram, &local_task.req_power,
+                    &local_task.priority, &local_task.deadline,
+                    &local_task.multi, &local_task.preempt, &local_task.checkpoint, &nn);
+                char *p = line;
+                for (int k = 0; k < 13 && p; k++) { p = strchr(p, ' '); if (p) p++; }
+                for (int k = 0; k < nn && p; k++) {
+                    sscanf(p, "%d %d %d",
+                           &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
+                    for (int f = 0; f < 3; f++) { p = strchr(p, ' '); if (p) p++; }
+                }
+                outf("CLIENT task %d: %s\n", idx, line);
+                srand(0xCAFEBABEu ^ (unsigned)idx);
+                init_pending = 0;
+                continue;
+            }
+            /* первая строка — не INIT (STATE при переподключении к живому серверу) */
+            init_pending = 0;
         }
 
         if (is_node && !strncmp(line, "NODE_WORK ", 10)) {
@@ -132,17 +181,18 @@ int cmd_client(int argc, char **argv) {
             char *p = line;
             for (int k = 0; k < 7 && p; k++) { p = strchr(p, ' '); if (p) p++; }
             for (int k = 0; k < nn && p; k++) {
-                sscanf(p, "%d %d %d", &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
+                sscanf(p, "%d %d %d",
+                       &node_caps[k][0], &node_caps[k][1], &node_caps[k][2]);
                 for (int f = 0; f < 3; f++) { p = strchr(p, ' '); if (p) p++; }
             }
             const char *ev = "none";
-            /* FIX: arrival <= t + флаг вместо arrival == t —
-             * задача регистрируется даже при позднем подключении клиента */
             if (status == WAITING && !arrival_reported && arrival <= t) {
                 arrival_reported = 1;
                 int all_c = 0, all_r = 0, all_p = 0;
                 for (int i = 0; i < nn; i++) {
-                    all_c += node_caps[i][0]; all_r += node_caps[i][1]; all_p += node_caps[i][2];
+                    all_c += node_caps[i][0];
+                    all_r += node_caps[i][1];
+                    all_p += node_caps[i][2];
                 }
                 int fit = (local_task.req_cores <= all_c &&
                            local_task.req_ram   <= all_r &&
@@ -167,6 +217,7 @@ int cmd_client(int argc, char **argv) {
         else if (is_task && !strncmp(line, "TASK_RESTARTED ", 15)) {
             int t, node_id;
             sscanf(line, "TASK_RESTARTED %d %d", &t, &node_id);
+            arrival_reported = 0;
             outf("CLIENT task %d: [t=%d] перезапущен после отказа node %d\n",
                  idx, t, node_id);
         }
@@ -178,9 +229,9 @@ int cmd_client(int argc, char **argv) {
         }
     }
 
-    close(fd);
+    if (fd >= 0) close(fd);
     if (log_fd >= 0) close(log_fd);
-    return 0;
+    return was_shutdown ? 0 : 1;
 }
 
 int cmd_monitor(int argc, char **argv) {

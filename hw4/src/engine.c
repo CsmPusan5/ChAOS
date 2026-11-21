@@ -123,11 +123,17 @@ void run_clock(void) {
 }
 
 void scheduler_work_with_arrival(int t) {
-    for (int i = 0; i < MAX_TASKS; i++)
-        if (tasks[i].status == WAITING && tasks[i].arrival_time > t)
-            tasks[i].status = (TaskStatus)99;
+    static int   hidden[MAX_TASKS];
+    static TaskStatus saved[MAX_TASKS];
+    for (int i = 0; i < MAX_TASKS; i++) {
+        hidden[i] = 0;
+        if (tasks[i].status == WAITING && tasks[i].arrival_time > t) {
+            saved[i] = tasks[i].status;
+            tasks[i].status = DONE;
+            hidden[i] = 1;
+        }
+    }
     scheduler_work(t);
     for (int i = 0; i < MAX_TASKS; i++)
-        if ((int)tasks[i].status == 99)
-            tasks[i].status = WAITING;
+        if (hidden[i]) tasks[i].status = saved[i];
 }

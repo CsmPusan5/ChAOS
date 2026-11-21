@@ -194,8 +194,35 @@ void set_center(void);
 void create_tasks(void);
 void init_simulation(void);
 
-/* ---------- main.c ---------- */
+/* ---------- Глобалы (определены в main.c) ---------- */
+extern int log_fd;
+extern volatile sig_atomic_t client_stop;   /* стоп-флаг клиента/монитора */
+
+/* ---------- sems.c ---------- */
+int         parse_strategy(const char *s);
+const char *strategy_name(void);
+const char *sem_mode_name(void);
+int         sems_init(int mode);
+void        sems_destroy(void);
+int         sems_attach_named(const char *prefix);
+
+/* ---------- engine.c ---------- */
+int  wait_ack_or_stop(void);
 void run_clock(void);
-int  worker_process(WorkerArg w);
+int worker_process(WorkerArg w);
+void scheduler_work_with_arrival(int t);
+
+/* ---------- main.c ---------- */
+void usage(const char *prog);
+void on_signal_client(int s);
+
+/* ---------- подкоманды ---------- */
+int cmd_legacy  (int argc, char **argv);
+int cmd_cluster (int argc, char **argv);
+int cmd_worker  (int argc, char **argv);
+int cmd_stop    (int argc, char **argv);
+int cmd_server  (int argc, char **argv);
+int cmd_client  (int argc, char **argv);
+int cmd_monitor (int argc, char **argv);
 
 #endif

@@ -11,6 +11,8 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/time.h>
+#include <sys/socket.h>
 
 SharedState *shm = NULL;
 int       log_fd = -1;
@@ -793,6 +795,7 @@ static int cmd_server(int argc, char **argv) {
     int fd_node[MAX_NODES], fd_task[MAX_TASKS];
     for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
     for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
+    int fd_monitor = -1;
 
     int accepted = 0;
     while (accepted < expected && !stop_flag) {
@@ -830,6 +833,15 @@ static int cmd_server(int argc, char **argv) {
                     center.nodes[i].max_power);
             net_send_line(fd, "%s", buf);
             outf("SERVER: подключён task %d\n", idx);
+        } else if (!strcmp(type, "monitor")) {
+            if (fd_monitor >= 0) close(fd_monitor);
+            fd_monitor = fd;
+            net_send_line(fd, "INIT_MONITOR %d %d %d %d %.2f %s %d %d %.4f %d",
+                MAX_NODES, MAX_TASKS,
+                center.power_limit, center.cooling_limit, center.pue,
+                strategy_name(), time_limit, tick_delay_ms,
+                fail_prob, repair_time);
+            outf("SERVER: подключён monitor\n");
         } else {
             close(fd);
         }
@@ -848,10 +860,41 @@ static int cmd_server(int argc, char **argv) {
     }
 
     /* ---- Тактовый цикл ---- */
+    /* После старта сервер принимает новые подключения монитора на лету. */
+    int lf = fcntl(listen_fd, F_GETFL);
+    fcntl(listen_fd, F_SETFL, lf | O_NONBLOCK);
+
+    /* ---- Тактовый цикл ---- */
     for (int t = 0; ; t++) {
         if (stop_flag) break;
         if (time_limit > 0 && t >= time_limit) { outf("SERVER: [t=%d] период завершён\n", t); break; }
         if (t > 0 && all_done()) { outf("SERVER: [t=%d] все задания обработаны\n", t); break; }
+
+        /* --- Неблокирующий приём нового монитора --- */
+        for (;;) {
+            int nfd = accept(listen_fd, NULL, NULL);
+            if (nfd < 0) break;
+            struct timeval tv = { 0, 100000 };  /* 100 мс на HELLO */
+            setsockopt(nfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            char hl[256];
+            int ok = 0;
+            if (net_recv_line(nfd, hl, sizeof hl) >= 0) {
+                char ty[16]; int ii;
+                if (sscanf(hl, "HELLO %15s %d", ty, &ii) == 2 &&
+                    !strcmp(ty, "monitor")) {
+                    if (fd_monitor >= 0) close(fd_monitor);
+                    fd_monitor = nfd;
+                    net_send_line(nfd, "INIT_MONITOR %d %d %d %d %.2f %s %d %d %.4f %d",
+                        MAX_NODES, MAX_TASKS,
+                        center.power_limit, center.cooling_limit, center.pue,
+                        strategy_name(), time_limit, tick_delay_ms,
+                        fail_prob, repair_time);
+                    outf("SERVER: подключён monitor (live)\n");
+                    ok = 1;
+                    }
+            }
+            if (!ok) close(nfd);
+        }
 
         cur_time = t;
 
@@ -962,7 +1005,7 @@ static int cmd_server(int argc, char **argv) {
                     off += snprintf(buf + off, sizeof buf - off, " %d", j);
             net_send_line(fd_node[i], "%s", buf);
         }
-        for (int j = 0; j < MAX_TASKS; j++) {
+                for (int j = 0; j < MAX_TASKS; j++) {
             Task *tk = &tasks[j];
             char buf[512];
             int off = snprintf(buf, sizeof buf, "TASK_STATE %d %d %d %d",
@@ -974,12 +1017,65 @@ static int cmd_server(int argc, char **argv) {
             net_send_line(fd_task[j], "%s", buf);
         }
 
+        /* --- Комплексный снимок для монитора --- */
+        if (fd_monitor >= 0) {
+            net_send_line(fd_monitor, "MONITOR_STATE %d", t);
+
+            for (int i = 0; i < MAX_NODES; i++) {
+                Node *n = &center.nodes[i];
+                int cnt = 0;
+                for (int j = 0; j < MAX_TASKS; j++)
+                    if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i))) cnt++;
+                char buf[1024];
+                int off = snprintf(buf, sizeof buf,
+                    "N %d %d %d %d %d %d %d %d %d %d",
+                    i, n->status, n->repair_left,
+                    n->used_cores, n->max_cores,
+                    n->user_ram, n->max_ram,
+                    n->used_power, n->max_power, cnt);
+                for (int j = 0; j < MAX_TASKS; j++)
+                    if (tasks[j].status == RUNNING && (tasks[j].used_mask & (1u << i)))
+                        off += snprintf(buf + off, sizeof buf - off, " %d", j);
+                net_send_line(fd_monitor, "%s", buf);
+            }
+
+            int tp = total_power();
+            net_send_line(fd_monitor, "PWR %d %d %.2f %d %d",
+                tp, center.power_limit, center.pue, tp, center.cooling_limit);
+
+            for (int j = 0; j < MAX_TASKS; j++) {
+                Task *tk = &tasks[j];
+                if (tk->status == RUNNING) {
+                    char buf[512];
+                    int off = snprintf(buf, sizeof buf, "RUN %d %s %d %d",
+                        j, tk->name, tk->time_remaining, tk->node_count);
+                    for (int i = 0; i < MAX_NODES; i++)
+                        if (tk->used_mask & (1u << i))
+                            off += snprintf(buf + off, sizeof buf - off, " %d", i);
+                    net_send_line(fd_monitor, "%s", buf);
+                }
+            }
+            for (int j = 0; j < MAX_TASKS; j++) {
+                Task *tk = &tasks[j];
+                if (tk->status == WAITING || tk->status == PREEMPTED)
+                    net_send_line(fd_monitor, "WAIT %d %s %d",
+                        j, tk->name, tk->status);
+            }
+            net_send_line(fd_monitor, "STAT %d %d %d %d %d %.0f",
+                stat_done, stat_failed, stat_preempt, stat_restart,
+                stat_node_fails, stat_energy);
+            net_send_line(fd_monitor, "END");
+        }
+
         delay_ms(tick_delay_ms);
     }
-
     /* ---- Завершение ---- */
     for (int i = 0; i < MAX_NODES; i++) net_send_line(fd_node[i], "SHUTDOWN");
     for (int j = 0; j < MAX_TASKS; j++) net_send_line(fd_task[j], "SHUTDOWN");
+    if (fd_monitor >= 0) {
+        net_send_line(fd_monitor, "SHUTDOWN");
+        close(fd_monitor);
+    }
     for (int i = 0; i < MAX_NODES; i++) if (fd_node[i] >= 0) close(fd_node[i]);
     for (int j = 0; j < MAX_TASKS; j++) if (fd_task[j] >= 0) close(fd_task[j]);
     close(listen_fd);
@@ -1164,6 +1260,133 @@ static int cmd_client(int argc, char **argv) {
     return 0;
 }
 
+/* ---- monitor ---- */
+static int cmd_monitor(int argc, char **argv) {
+    const char *host = NULL;
+    int port = 0;
+    const char *log_path = "log_monitor.log";
+
+    for (int i = 2; i < argc; i++) {
+        if      (!strcmp(argv[i], "--host") && i + 1 < argc) host     = argv[++i];
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) port     = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-l")     && i + 1 < argc) log_path = argv[++i];
+        else { fprintf(stderr, "monitor: неизвестный ключ %s\n", argv[i]); return 1; }
+    }
+    if (!host || port <= 0) {
+        fprintf(stderr, "Использование: %s monitor --host H --port P [-l файл]\n", argv[0]);
+        return 1;
+    }
+
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal_client;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+
+    int fd = net_connect(host, port);
+    if (fd < 0) {
+        fprintf(stderr, "monitor: connect %s:%d не удался\n", host, port);
+        if (log_fd >= 0) close(log_fd);
+        return 1;
+    }
+    net_send_line(fd, "HELLO monitor 0");
+
+    char line[2048];
+    if (net_recv_line(fd, line, sizeof line) < 0) {
+        close(fd); if (log_fd >= 0) close(log_fd); return 1;
+    }
+
+    int max_n, max_t, plimit, climit, tlimit, tdelay, rtime;
+    char strat[16];
+    double pue, fprob;
+    if (sscanf(line,
+               "INIT_MONITOR %d %d %d %d %lf %15s %d %d %lf %d",
+               &max_n, &max_t, &plimit, &climit, &pue, strat,
+               &tlimit, &tdelay, &fprob, &rtime) != 10) {
+        fprintf(stderr, "monitor: неверный INIT (%s)\n", line);
+        close(fd); if (log_fd >= 0) close(log_fd); return 1;
+    }
+
+    out("====================================================================\n");
+    out("  МОНИТОР ВЫЧИСЛИТЕЛЬНОГО ЦЕНТРА (комплексный вид)\n");
+    out("====================================================================\n");
+    outf("Сервер %s:%d, узлов %d, заданий %d\n", host, port, max_n, max_t);
+    outf("Стратегия %s, период %d, задержка %d мс, отказы %.4f/тик, ремонт %d\n",
+         strat, tlimit, tdelay, fprob, rtime);
+    outf("Лимит питания %d Вт (PUE %.2f), охлаждение %d Вт\n",
+         plimit, pue, climit);
+    out("--------------------------------------------------------------------\n");
+
+    for (;;) {
+        if (net_recv_line(fd, line, sizeof line) < 0) {
+            if (client_stop) outf("monitor: прервано пользователем\n");
+            else             outf("monitor: соединение закрыто\n");
+            break;
+        }
+        if (!strcmp(line, "SHUTDOWN")) {
+            outf("monitor: SHUTDOWN — сервер завершил работу\n");
+            break;
+        }
+        if (strncmp(line, "MONITOR_STATE ", 14) != 0) continue;
+
+        int t;
+        sscanf(line, "MONITOR_STATE %d", &t);
+        outf("\n[t=%3d] ============================================================\n", t);
+
+        while (net_recv_line(fd, line, sizeof line) >= 0) {
+            if (!strcmp(line, "END")) break;
+
+            if (line[0] == 'N' && line[1] == ' ') {
+                int id, status, rl, uc, mc, ur, mr, up, mp, nt;
+                sscanf(line, "N %d %d %d %d %d %d %d %d %d %d",
+                       &id, &status, &rl, &uc, &mc, &ur, &mr, &up, &mp, &nt);
+                char bar[21];
+                int filled = mc ? (uc * 20) / mc : 0;
+                for (int k = 0; k < 20; k++) bar[k] = (k < filled) ? '#' : '.';
+                bar[20] = '\0';
+                outf("    %d [%s] ядра %2d/%2d  память %3d/%3dГБ  "
+                     "мощность %4d/%4dВт  %s\n",
+                     id, bar, uc, mc, ur, mr, up, mp,
+                     status == NODE_OK ? "ОК" : "ОТКАЗ");
+            }
+            else if (!strncmp(line, "PWR ", 4)) {
+                int tp, pl, heat, cl;
+                double p;
+                sscanf(line, "PWR %d %d %lf %d %d", &tp, &pl, &p, &heat, &cl);
+                outf("    Питание: %d/%dВт (с PUE %.2f = %.0fВт). Тепло: %d/%dВт\n",
+                     tp, pl, p, (double)tp * p, heat, cl);
+            }
+            else if (!strncmp(line, "RUN ", 4)) {
+                int id, rem, nc;
+                char name[16];
+                sscanf(line, "RUN %d %15s %d %d", &id, name, &rem, &nc);
+                outf("    Выполняется: %s(ост.%d) узлов=%d\n", name, rem, nc);
+            }
+            else if (!strncmp(line, "WAIT ", 5)) {
+                int id, st;
+                char name[16];
+                sscanf(line, "WAIT %d %15s %d", &id, name, &st);
+                outf("    Ожидает: %s (%s)\n", name,
+                     st == PREEMPTED ? "вытеснено" : "в очереди");
+            }
+            else if (!strncmp(line, "STAT ", 5)) {
+                int d, f, p, r, nf;
+                double e;
+                sscanf(line, "STAT %d %d %d %d %d %lf", &d, &f, &p, &r, &nf, &e);
+                outf("    Итог: done=%d failed=%d preempt=%d restart=%d "
+                     "nodefails=%d energy=%.0f\n", d, f, p, r, nf, e);
+            }
+        }
+    }
+
+    close(fd);
+    if (log_fd >= 0) close(log_fd);
+    return 0;
+}
+
 /* ---- stop: внешняя остановка ---- */
 static int cmd_stop(int argc, char **argv) {
     if (argc < 3) {
@@ -1182,6 +1405,7 @@ int main(int argc, char **argv) {
     if (argc >= 2) {
         if (!strcmp(argv[1], "server"))  return cmd_server(argc, argv);
         if (!strcmp(argv[1], "client"))  return cmd_client(argc, argv);
+        if (!strcmp(argv[1], "monitor")) return cmd_monitor(argc, argv);
         if (!strcmp(argv[1], "cluster")) return cmd_cluster(argc, argv);
         if (!strcmp(argv[1], "worker"))  return cmd_worker(argc, argv);
         if (!strcmp(argv[1], "stop"))    return cmd_stop(argc, argv);
@@ -1191,6 +1415,8 @@ int main(int argc, char **argv) {
                 "\nПодкоманды:\n"
                 "  server --port P [опции]         — сервер (клиент-серверная модель)\n"
                 "  client --host H --port P --type node|task --idx N [-l file]\n"
+                "  monitor --host H --port P [-l file]\n"
+                "                                  — комплексный клиент (всё состояние)\n"
                 "  cluster [опции]                 — fork/exec воркеров (7-8)\n"
                 "  worker <node|task|sched> <idx>  — воркер для cluster\n"
                 "  stop <master_pid>               — SIGTERM мастеру\n");

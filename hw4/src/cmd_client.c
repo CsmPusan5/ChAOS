@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/socket.h>
 
 volatile sig_atomic_t client_stop = 0;
 void on_signal_client(int s) { (void)s; client_stop = 1; }

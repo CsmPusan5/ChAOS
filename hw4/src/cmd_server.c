@@ -15,13 +15,14 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <poll.h>
 
 #define MAX_MONITORS 16
 #define GRACE_MS     5000    /* макс. время ожидания стартовых клиентов */
 
 /* ---------- Мониторы ---------- */
 static int monitor_register(int *slots, int nslots, int fd, int t_delay) {
-    struct timeval tv = { 0, 100000 };
+    struct timeval tv = { 0, 20000 };
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
 
@@ -39,6 +40,20 @@ static int monitor_register(int *slots, int nslots, int fd, int t_delay) {
 
     slots[slot] = fd;
     return slot;
+}
+
+static int socket_alive(int fd) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int r = poll(&pfd, 1, 0);
+    if (r < 0) return 1;
+    if (r == 0) return 1;
+    if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) return 0;
+    if (pfd.revents & POLLIN) {
+        char c;
+        ssize_t n = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (n == 0) return 0;
+    }
+    return 1;
 }
 
 static int monitor_send_state(int fd, int t) {
@@ -138,11 +153,19 @@ static void send_task_init(int fd, int idx, int t) {
 static int handle_connection(int fd, int t,
                              int *fd_node, int *fd_task,
                              int *fd_mon, int nmon, int tdelay) {
-    struct timeval tv = { 0, 200000 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    struct timeval tv_hello = { 2, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_hello, sizeof tv_hello);
 
     char line[256];
     if (net_recv_line(fd, line, sizeof line) < 0) { close(fd); return -1; }
+
+    int sndbuf = 8192;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
+
+    struct timeval tv_rcv = { 0, 200000 };
+    struct timeval tv_snd = { 0,  100000 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv_rcv, sizeof tv_rcv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv_snd, sizeof tv_snd);
 
     char type[16]; int idx;
     if (sscanf(line, "HELLO %15s %d", type, &idx) != 2) { close(fd); return -1; }
@@ -171,7 +194,8 @@ static int handle_connection(int fd, int t,
             outf("SERVER: [t=%d] monitor отклонён (нет слотов)\n", t);
             return -1;
         }
-        outf("SERVER: [t=%d] подключён monitor #%d\n", t, slot);
+        outf("SERVER: [t=%d] подключён monitor #%d%s\n", t, slot,
+              t > 0 ? " (live)" : "");
         return 0;
     }
     close(fd);
@@ -216,6 +240,7 @@ int cmd_server(int argc, char **argv) {
             if (def_fail < 0.0) def_fail = 0.0;
             if (def_fail > 1.0) def_fail = 1.0;
         } else if (!strcmp(argv[i], "-l")        && i+1<argc) log_path       = argv[++i];
+        else if (!strcmp(argv[i], "-q"))         def_verbose    = 0;
         else { fprintf(stderr, "server: неизвестный ключ %s\n", argv[i]); return 1; }
     }
     if (port <= 0) { fprintf(stderr, "server: --port обязателен\n"); return 1; }
@@ -253,6 +278,11 @@ int cmd_server(int argc, char **argv) {
     for (int i = 0; i < MAX_NODES; i++) fd_node[i] = -1;
     for (int j = 0; j < MAX_TASKS; j++) fd_task[j] = -1;
     for (int m = 0; m < MAX_MONITORS; m++) fd_monitor[m] = -1;
+    int mon_strikes[MAX_MONITORS];
+    for (int m = 0; m < MAX_MONITORS; m++) {
+        fd_monitor[m]  = -1;
+        mon_strikes[m] = 0;
+    }
 
     pid_t children[MAX_NODES + MAX_TASKS];
     int nchildren = 0;
@@ -338,7 +368,7 @@ int cmd_server(int argc, char **argv) {
                 center.nodes[i].status      = NODE_FAILED;
                 center.nodes[i].repair_left = 0;
                 restart_tasks_on_node(i, t);
-            }
+                    }
         }
         for (int i = 0; i < MAX_NODES; i++) {
             if (fd_node[i] < 0) continue;
@@ -355,7 +385,8 @@ int cmd_server(int argc, char **argv) {
             if (sscanf(line, "NODE_RESULT %d %d %15s", &st, &rl, ev) != 3) continue;
             center.nodes[i].status = st;
             center.nodes[i].repair_left = rl;
-            outf("SERVER: [t=%d] от node %d: %s\n", t, i, ev);
+            if (verbose)
+                outf("SERVER: [t=%d] от node %d: %s\n", t, i, ev);
             if (!strcmp(ev, "failed")) {
                 stat_node_fails++;
                 for (int j = 0; j < MAX_TASKS; j++) {
@@ -487,13 +518,20 @@ int cmd_server(int argc, char **argv) {
         /* MONITOR_STATE */
         for (int m = 0; m < MAX_MONITORS; m++) {
             if (fd_monitor[m] < 0) continue;
-            if (monitor_send_state(fd_monitor[m], t) < 0) {
-                outf("SERVER: [t=%d] monitor #%d отключён\n", t, m);
-                close(fd_monitor[m]); fd_monitor[m] = -1;
-            }
+            if (!socket_alive(fd_monitor[m]) ||
+                monitor_send_state(fd_monitor[m], t) < 0) {
+                if (++mon_strikes[m] >= 3) {
+                    outf("SERVER: [t=%d] monitor #%d отключён (send failed)\n", t, m);
+                    close(fd_monitor[m]);
+                    fd_monitor[m]  = -1;
+                    mon_strikes[m] = 0;
+                } else {
+                    outf("SERVER: [t=%d] monitor #%d таймаут %d/3\n", t, m, mon_strikes[m]);
+                }
+                } else {
+                    mon_strikes[m] = 0;
+                }
         }
-
-        delay_ms(tick_delay_ms);
     }
 
     /* ---- Завершение: SHUTDOWN всем активным ---- */
